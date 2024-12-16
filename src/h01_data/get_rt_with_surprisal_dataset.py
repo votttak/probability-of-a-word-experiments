@@ -14,6 +14,7 @@ def get_args():
     # Data
     parser.add_argument('--surprisal-fname', type=str, required=True)
     parser.add_argument('--rt-fname', type=str, required=True)
+    parser.add_argument('--language', type=str, default='english')
     # Output
     parser.add_argument('--output-fname', type=str, required=True)
 
@@ -36,13 +37,14 @@ def merge_rt_and_surprisal(args):
         how='outer').reset_index()
     
     assert not df.surprisal.isna().any()
-    assert (df.word == df.ref_token).all()
+    if args.language not in {'he', 'gr'}:
+        assert (df.word == df.ref_token).all()
     return df
 
 
-def get_frequencies(df):
+def get_frequencies(df, language):
     df['freq'] = df['word'].apply(
-        lambda x: unigram.frequency(x))
+        lambda x: unigram.frequency(x, lang=language))
 
 
 def get_spillover_vars(df):
@@ -51,9 +53,10 @@ def get_spillover_vars(df):
         df['prev2_' + variable] = df.groupby("text_id", sort=False)[variable].shift(periods=2, fill_value=None)
         df['prev3_' + variable] = df.groupby("text_id", sort=False)[variable].shift(periods=3, fill_value=None)
 
+
 def get_rt_with_surprisal_dataset(args):
     df = merge_rt_and_surprisal(args)
-    get_frequencies(df)
+    get_frequencies(df, args.language)
     get_spillover_vars(df)
 
     return df

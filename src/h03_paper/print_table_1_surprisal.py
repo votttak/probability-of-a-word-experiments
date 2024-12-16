@@ -29,7 +29,7 @@ def get_args():
 
 def get_spillover_llh(model, datasets, predictor, predictor_type, predictor_times):
     dfs = []
-    fname_base = 'checkpoints/delta_llh/llh-%s-%s.tsv'
+    fname_base = 'checkpoints/rt/delta_llh/llh-%s-%s.tsv'
     for dataset in datasets:
         fname = fname_base % (dataset, model)
         df = pd.read_csv(fname, sep='\t')
@@ -125,8 +125,9 @@ def get_color_str(pvalue, is_positive_good, diff):
 def print_deltallh(df, datasets, predictors, predictor_times, scaler=100,
                    print_preffix='', is_positive_good=True,
                    dataset_names=constants.DATASET_NAMES):
+    print_str = ''
     for dataset in datasets:
-        print_str = '%s%s ' % (print_preffix, dataset_names[dataset])
+        # print_str = '%s%s ' % (print_preffix, dataset_names[dataset])
 
         for predictor_base, predictor_type in predictors:
             for predictor_time in predictor_times:
@@ -146,9 +147,9 @@ def print_deltallh(df, datasets, predictors, predictor_times, scaler=100,
                 color_str = get_color_str(pvalue, is_positive_good, diff)
 
                 print_str += '& %s%s%.2f}%s' % (sign_str, color_str, diff * scaler, pvalue_str)
-        print_str += ' \\\\'
+    print_str += ' \\\\'
 
-        print(print_str)
+    print(print_str)
 
 
 def get_corrections(df):
@@ -186,17 +187,16 @@ def get_pvalues(model, datasets, predictors, predictor_times):
 
 def main():
     args = get_args()
-    predictor_times = ['prev3_', 'prev2_', 'prev_', '']
+    # predictor_times = ['prev3_', 'prev2_', 'prev_', '']
+    predictor_times = ['']
     predictors = [(args.predictor, 'new'), (args.predictor, 'new_raw'), ('surprisal_buggy', 'new_raw')]
     models = ['gpt2-small', 'gpt2-medium', 'gpt2-large', 'gpt2-xl']
     models += ['pythia-70m', 'pythia-160m', 'pythia-410m', 'pythia-14b', 'pythia-28b', 'pythia-69b', 'pythia-120b']
-    # models += ['pythia-70m', 'pythia-160m', 'pythia-410m', 'pythia-14b', 'pythia-28b']
-    # datasets = ['brown', 'natural_stories', 'provo_skip2zero']
-    datasets = ['natural_stories', 'provo', 'dundee']
-    # predictors = []
+    datasets = ['brown', 'natural_stories', 'provo', 'dundee']
 
     for model in models:
-        print('\\midrule\\multirow{4}{*}{%s}' % model)
+        # print('\\midrule\\multirow{4}{*}{%s}' % model)
+        print('%s' % model)
         df_pvalue = get_pvalues(model, datasets, predictors, predictor_times)
         print_deltallh(df_pvalue, datasets, predictors, predictor_times, print_preffix='& ')
 
