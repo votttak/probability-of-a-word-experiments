@@ -1,0 +1,4 @@
+# N-GRAM: HTTP client used by get_ngram_surprisals.py for the public API.
+requests>=2.28
+# N-GRAM: Loads only the pinned matching Llama-2 tokenizer; no model weights.
+transformers>=4.40

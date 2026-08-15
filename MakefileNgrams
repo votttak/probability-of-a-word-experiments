@@ -1,0 +1,100 @@
+# N-GRAM: Keep the established Makefile as the source of truth for datasets,
+# neural-LM surprisals, preprocessing, and controls. This file adds an opt-in
+# n-gram branch without changing existing targets or checkpoint files.
+.DEFAULT_GOAL := ngram
+include Makefile
+
+# N-GRAM: Context length is the number of preceding whitespace-delimited words;
+# context 0 is a unigram, context 1 is a bigram, and so on.
+NGRAM_INDEX ?= v4_piletrain_llama
+NGRAM_CONTEXT_LENGTHS ?= 0 1 2 3 4
+NGRAM_BACKOFF_ALPHA ?= 0.4
+NGRAM_API_URL ?= https://api.infini-gram.io/
+NGRAM_WORKERS ?= 4
+NGRAM_TIMEOUT ?= 30
+# N-GRAM: Eight bounded attempts span up to 91 seconds of backoff, safely above
+# the 15–30 second transient 403 cooldown measured on long API runs.
+NGRAM_MAX_RETRIES ?= 8
+# N-GRAM: The pinned public Llama-2 tokenizer produces deterministic query IDs;
+# only its small tokenizer files (never model weights) enter the project cache.
+NGRAM_TOKENIZER ?= NousResearch/Llama-2-7b-hf
+NGRAM_TOKENIZER_REVISION ?= 8efe6c9b93655b934e27bd9981e3ec13e55aee9d
+NGRAM_TOKENIZER_CACHE_DIR ?= .cache/huggingface/
+
+# N-GRAM: Encode all score-defining options in filenames to prevent Make from
+# reusing checkpoints produced with a different index, context set, or alpha.
+ngram_empty :=
+ngram_space := $(ngram_empty) $(ngram_empty)
+NGRAM_CONTEXT_TAG := $(subst $(ngram_space),-,$(strip $(NGRAM_CONTEXT_LENGTHS)))
+NGRAM_ALPHA_TAG := $(subst .,_,$(NGRAM_BACKOFF_ALPHA))
+NGRAM_CONFIG_TAG := $(NGRAM_INDEX)-contexts_$(NGRAM_CONTEXT_TAG)-alpha_$(NGRAM_ALPHA_TAG)
+
+# N-GRAM: API counts are model-independent and cached across datasets; merged
+# data and LLH outputs remain model-specific because they include LM baselines.
+NGRAM_SURPRISALS_DIR := $(CHECKPOINT_DIR)/ngram_surprisals_rt_data/
+NGRAM_CACHE_DIR := .cache/ngram_count_cache/
+NGRAM_MERGED_DATA_DIR := $(CHECKPOINT_DIR)/merged_ngram_data/
+NGRAM_PARAMS_DIR := $(CHECKPOINT_DIR)/ngram_params/
+NGRAM_DELTA_LLH_DIR := $(CHECKPOINT_DIR)/ngram_delta_llh/
+
+NGRAM_SURPRISALS_FILE := $(NGRAM_SURPRISALS_DIR)/ngram-$(DATASET)-$(NGRAM_CONFIG_TAG).tsv
+NGRAM_CACHE_FILE := $(NGRAM_CACHE_DIR)/$(NGRAM_INDEX).sqlite
+NGRAM_MERGED_DATA_FILE := $(NGRAM_MERGED_DATA_DIR)/$(DATASET)-$(MODEL)-$(NGRAM_CONFIG_TAG).tsv
+NGRAM_ANALYSIS_PARAMS_FNAME_BASE := $(NGRAM_PARAMS_DIR)/params-$(DATASET)-$(MODEL)-$(NGRAM_CONFIG_TAG)
+NGRAM_LLH_FILE := $(NGRAM_DELTA_LLH_DIR)/llh-$(DATASET)-$(MODEL)-$(NGRAM_CONFIG_TAG).tsv
+
+# N-GRAM: These phony entry points make the new pipeline explicit. Running the
+# original Makefile continues to produce only the original experiment.
+.PHONY: ngram process_ngram_data get_ngram_llh
+ngram: get_ngram_llh
+
+process_ngram_data: $(NGRAM_MERGED_DATA_FILE)
+
+get_ngram_llh: $(NGRAM_LLH_FILE)
+
+# N-GRAM: Analyze the opt-in merged dataset with the dedicated R script. Code
+# files are prerequisites so an implementation change invalidates stale output.
+$(NGRAM_LLH_FILE): $(NGRAM_MERGED_DATA_FILE) \
+                  src/h02_rt_model/rt_vs_ngram_surprisal.R \
+                  src/h02_rt_model/r_utils.R \
+                  src/h02_rt_model/predictors.R \
+                  src/h02_rt_model/baselines.R
+	mkdir -p $(NGRAM_PARAMS_DIR)
+	mkdir -p $(NGRAM_DELTA_LLH_DIR)
+	Rscript src/h02_rt_model/rt_vs_ngram_surprisal.R $(NGRAM_MERGED_DATA_FILE) $(NGRAM_LLH_FILE) $(NGRAM_ANALYSIS_PARAMS_FNAME_BASE) --merge-workers --is-linear
+
+# N-GRAM: Merge by text_id/word_id and validate word equality before generating
+# current-word and three-word spillover columns.
+$(NGRAM_MERGED_DATA_FILE): $(PREPROCESSED_RT_FILE) \
+                           $(SURPRISALS_FILE) \
+                           $(NGRAM_SURPRISALS_FILE) \
+                           src/h01_data/get_rt_with_surprisal_dataset.py
+	mkdir -p $(NGRAM_MERGED_DATA_DIR)
+	python src/h01_data/get_rt_with_surprisal_dataset.py \
+		--rt-fname $(PREPROCESSED_RT_FILE) \
+		--surprisal-fname $(SURPRISALS_FILE) \
+		--ngram-surprisal-fname $(NGRAM_SURPRISALS_FILE) \
+		--output-fname $(NGRAM_MERGED_DATA_FILE)
+
+# N-GRAM: Compute all requested contexts in one pass. The persistent SQLite
+# cache and atomic TSV output make large remote-API jobs safe to resume.
+$(NGRAM_SURPRISALS_FILE): $(TEXT_RT_FILE) \
+                          src/h01_data/get_ngram_surprisals.py
+	mkdir -p $(NGRAM_SURPRISALS_DIR)
+	mkdir -p $(NGRAM_CACHE_DIR)
+	# N-GRAM: The local directory holds only the small public tokenizer files.
+	mkdir -p $(NGRAM_TOKENIZER_CACHE_DIR)
+	python src/h01_data/get_ngram_surprisals.py \
+		--input-fname $(TEXT_RT_FILE) \
+		--output-fname $(NGRAM_SURPRISALS_FILE) \
+		--cache-fname $(NGRAM_CACHE_FILE) \
+		--index $(NGRAM_INDEX) \
+		--context-lengths $(NGRAM_CONTEXT_LENGTHS) \
+		--backoff-alpha $(NGRAM_BACKOFF_ALPHA) \
+		--api-url $(NGRAM_API_URL) \
+		--tokenizer $(NGRAM_TOKENIZER) \
+		--tokenizer-revision $(NGRAM_TOKENIZER_REVISION) \
+		--tokenizer-cache-dir $(NGRAM_TOKENIZER_CACHE_DIR) \
+		--workers $(NGRAM_WORKERS) \
+		--timeout $(NGRAM_TIMEOUT) \
+		--max-retries $(NGRAM_MAX_RETRIES)

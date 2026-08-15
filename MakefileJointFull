@@ -1,0 +1,125 @@
+# Complete-corpus paired evaluation of n-gram (A) and context-limited (B)
+# surprisal. This mirrors MakefileJointPilot but scores every word in each
+# passage instead of creating a fixed-length prefix sample.
+.DEFAULT_GOAL := joint_full
+
+DATASET ?= natural_stories
+MODEL ?= gpt2-small
+# Preserve these defaults while importing Makefile, whose ordinary assignments
+# otherwise replace MODEL with pythia-70m. Command-line values remain usable.
+override DATASET := $(DATASET)
+override MODEL := $(MODEL)
+include Makefile
+
+# The joint merger currently maps zero-based predictor IDs to the one-based
+# Natural Stories RT table. Reject datasets whose ID convention is unverified.
+ifneq ($(DATASET),natural_stories)
+$(error MakefileJointFull currently supports only DATASET=natural_stories)
+endif
+
+JOINT_FOLDS ?= 10
+JOINT_SEED ?= 42
+
+NGRAM_INDEX ?= v4_piletrain_llama
+NGRAM_CONTEXT_LENGTHS ?= 0 1 2 3 4
+NGRAM_BACKOFF_ALPHA ?= 0.4
+NGRAM_API_URL ?= https://api.infini-gram.io/
+NGRAM_WORKERS ?= 4
+NGRAM_TIMEOUT ?= 30
+NGRAM_MAX_RETRIES ?= 8
+NGRAM_TOKENIZER ?= NousResearch/Llama-2-7b-hf
+NGRAM_TOKENIZER_REVISION ?= 8efe6c9b93655b934e27bd9981e3ec13e55aee9d
+
+CONTEXT_LIMITED_CONTEXT_LENGTHS ?= 1 2 4
+CONTEXT_LIMITED_BATCH_SIZE ?= 8
+
+CACHE_DIR ?= .cache
+NGRAM_TOKENIZER_CACHE_DIR ?= $(CACHE_DIR)/huggingface/
+
+JOINT_FULL_CHECKPOINT_ROOT := $(patsubst %/,%,$(CHECKPOINT_DIR))
+JOINT_FULL_RESULTS_ROOT := $(patsubst %/,%,$(RESULTS_DIR))
+NGRAM_CACHE_DIR := $(CACHE_DIR)/ngram_count_cache
+
+joint_full_empty :=
+joint_full_space := $(joint_full_empty) $(joint_full_empty)
+NGRAM_CONTEXT_TAG := $(subst $(joint_full_space),-,$(strip $(NGRAM_CONTEXT_LENGTHS)))
+CONTEXT_TAG := $(subst $(joint_full_space),-,$(strip $(CONTEXT_LIMITED_CONTEXT_LENGTHS)))
+NGRAM_ALPHA_TAG := $(subst .,_,$(NGRAM_BACKOFF_ALPHA))
+NGRAM_INDEX_TAG := $(subst :,_,$(subst /,_,$(NGRAM_INDEX)))
+JOINT_FULL_PREDICTOR_TAG := $(DATASET)-$(MODEL)-ngram_$(NGRAM_INDEX_TAG)-contexts_$(NGRAM_CONTEXT_TAG)-alpha_$(NGRAM_ALPHA_TAG)-context_$(CONTEXT_TAG)
+JOINT_FULL_ANALYSIS_TAG := $(JOINT_FULL_PREDICTOR_TAG)-folds_$(JOINT_FOLDS)-seed_$(JOINT_SEED)
+
+JOINT_FULL_CHECKPOINT_DIR := $(JOINT_FULL_CHECKPOINT_ROOT)/joint_full/$(JOINT_FULL_PREDICTOR_TAG)
+JOINT_FULL_RESULTS_DIR := $(JOINT_FULL_RESULTS_ROOT)/joint_full/$(JOINT_FULL_ANALYSIS_TAG)
+JOINT_FULL_NGRAM_FILE := $(JOINT_FULL_CHECKPOINT_DIR)/ngram.tsv
+JOINT_FULL_CONTEXT_FILE := $(JOINT_FULL_CHECKPOINT_DIR)/context-limited.tsv
+JOINT_FULL_DATA_FILE := $(JOINT_FULL_CHECKPOINT_DIR)/joint-data.tsv
+JOINT_FULL_FOLD_FILE := $(JOINT_FULL_RESULTS_DIR)/fold-results.tsv
+JOINT_FULL_A_PIVOT_FILE := $(JOINT_FULL_RESULTS_DIR)/delta-a-given-b-mean.tsv
+JOINT_FULL_B_PIVOT_FILE := $(JOINT_FULL_RESULTS_DIR)/delta-b-given-a-mean.tsv
+JOINT_FULL_A_SE_FILE := $(JOINT_FULL_RESULTS_DIR)/delta-a-given-b-se.tsv
+JOINT_FULL_B_SE_FILE := $(JOINT_FULL_RESULTS_DIR)/delta-b-given-a-se.tsv
+JOINT_FULL_SUMMARY_FILE := $(JOINT_FULL_RESULTS_DIR)/summary.tsv
+NGRAM_CACHE_FILE := $(NGRAM_CACHE_DIR)/$(NGRAM_INDEX_TAG).sqlite
+
+.PHONY: joint_full joint_full_data
+joint_full: $(JOINT_FULL_SUMMARY_FILE)
+	@echo "Joint full experiment complete: $(JOINT_FULL_RESULTS_DIR)"
+
+joint_full_data: $(JOINT_FULL_DATA_FILE)
+
+# The original stage recipes rely on process_data to impose their ordering.
+# Add the missing file dependencies here so this entry point also works from a
+# fresh checkout while downloading only the Natural Stories inputs it needs.
+$(TEXT_RT_FILE): $(NS_FILE2) src/h01_data/extract_rt_text.py
+$(PREPROCESSED_RT_FILE): $(NS_FILE2) src/h01_data/preprocess_rt_dataset.py
+$(SURPRISALS_FILE): $(TEXT_RT_FILE)
+$(MERGED_DATA_FILE): $(PREPROCESSED_RT_FILE) $(SURPRISALS_FILE) \
+                     src/h01_data/get_rt_with_surprisal_dataset.py
+
+# Both predictor families consume the exact complete-corpus text checkpoint.
+$(JOINT_FULL_NGRAM_FILE): $(TEXT_RT_FILE) src/h01_data/get_ngram_surprisals.py
+	mkdir -p $(JOINT_FULL_CHECKPOINT_DIR) $(NGRAM_CACHE_DIR) $(NGRAM_TOKENIZER_CACHE_DIR)
+	python src/h01_data/get_ngram_surprisals.py \
+		--input-fname $(TEXT_RT_FILE) \
+		--output-fname $(JOINT_FULL_NGRAM_FILE) \
+		--cache-fname $(NGRAM_CACHE_FILE) \
+		--index $(NGRAM_INDEX) \
+		--context-lengths $(NGRAM_CONTEXT_LENGTHS) \
+		--backoff-alpha $(NGRAM_BACKOFF_ALPHA) \
+		--api-url $(NGRAM_API_URL) \
+		--tokenizer $(NGRAM_TOKENIZER) \
+		--tokenizer-revision $(NGRAM_TOKENIZER_REVISION) \
+		--tokenizer-cache-dir $(NGRAM_TOKENIZER_CACHE_DIR) \
+		--workers $(NGRAM_WORKERS) \
+		--timeout $(NGRAM_TIMEOUT) \
+		--max-retries $(NGRAM_MAX_RETRIES)
+
+$(JOINT_FULL_CONTEXT_FILE): $(TEXT_RT_FILE) src/h01_data/get_context_limited_surprisals.py
+	mkdir -p $(JOINT_FULL_CHECKPOINT_DIR)
+	python src/h01_data/get_context_limited_surprisals.py \
+		--input-fname $(TEXT_RT_FILE) \
+		--output-fname $(JOINT_FULL_CONTEXT_FILE) \
+		--model $(MODEL) \
+		--context-lengths $(CONTEXT_LIMITED_CONTEXT_LENGTHS) \
+		--batch-size $(CONTEXT_LIMITED_BATCH_SIZE)
+
+$(JOINT_FULL_DATA_FILE): $(MERGED_DATA_FILE) $(JOINT_FULL_NGRAM_FILE) \
+                         $(JOINT_FULL_CONTEXT_FILE) \
+                         src/h01_data/build_joint_pilot_dataset.py
+	python src/h01_data/build_joint_pilot_dataset.py \
+		--base-merged-fname $(MERGED_DATA_FILE) \
+		--ngram-surprisal-fname $(JOINT_FULL_NGRAM_FILE) \
+		--context-limited-surprisal-fname $(JOINT_FULL_CONTEXT_FILE) \
+		--output-fname $(JOINT_FULL_DATA_FILE)
+
+# The evaluator writes each result atomically and summary.tsv last, so Make
+# only reports completion after every fold table and pivot has been written.
+$(JOINT_FULL_SUMMARY_FILE): $(JOINT_FULL_DATA_FILE) \
+                            src/h02_rt_model/rt_vs_joint_pilot_surprisal.R
+	mkdir -p $(JOINT_FULL_RESULTS_DIR)
+	Rscript src/h02_rt_model/rt_vs_joint_pilot_surprisal.R \
+		$(JOINT_FULL_DATA_FILE) $(JOINT_FULL_FOLD_FILE) \
+		$(JOINT_FULL_A_PIVOT_FILE) $(JOINT_FULL_B_PIVOT_FILE) \
+		$(JOINT_FULL_A_SE_FILE) $(JOINT_FULL_B_SE_FILE) \
+		$(JOINT_FULL_SUMMARY_FILE) $(JOINT_FOLDS) $(JOINT_SEED)

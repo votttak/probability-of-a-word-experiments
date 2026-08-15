@@ -1,0 +1,109 @@
+# Reproducible paired pilot for n-gram (A) and context-limited (B) surprisal.
+.DEFAULT_GOAL := joint_pilot
+
+DATASET ?= natural_stories
+MODEL ?= gpt2-small
+PILOT_WORDS_PER_TEXT ?= 50
+PILOT_FOLDS ?= 10
+PILOT_SEED ?= 42
+
+NGRAM_INDEX ?= v4_piletrain_llama
+NGRAM_CONTEXT_LENGTHS ?= 0 1 2 3 4
+NGRAM_BACKOFF_ALPHA ?= 0.4
+NGRAM_API_URL ?= https://api.infini-gram.io/
+NGRAM_WORKERS ?= 4
+NGRAM_TIMEOUT ?= 30
+NGRAM_MAX_RETRIES ?= 8
+NGRAM_TOKENIZER ?= NousResearch/Llama-2-7b-hf
+NGRAM_TOKENIZER_REVISION ?= 8efe6c9b93655b934e27bd9981e3ec13e55aee9d
+NGRAM_TOKENIZER_CACHE_DIR ?= .cache/huggingface/
+
+CONTEXT_LIMITED_CONTEXT_LENGTHS ?= 1 2 4
+CONTEXT_LIMITED_BATCH_SIZE ?= 8
+
+CHECKPOINT_DIR ?= checkpoints/rt
+RESULTS_DIR ?= results/rt
+FULL_TEXT_FILE := $(CHECKPOINT_DIR)/text_rt_data/$(DATASET).txt
+BASE_MERGED_FILE := $(CHECKPOINT_DIR)/merged_data/$(DATASET)-$(MODEL).tsv
+NGRAM_CACHE_FILE := .cache/ngram_count_cache/$(NGRAM_INDEX).sqlite
+
+pilot_empty :=
+pilot_space := $(pilot_empty) $(pilot_empty)
+NGRAM_CONTEXT_TAG := $(subst $(pilot_space),-,$(strip $(NGRAM_CONTEXT_LENGTHS)))
+CONTEXT_TAG := $(subst $(pilot_space),-,$(strip $(CONTEXT_LIMITED_CONTEXT_LENGTHS)))
+NGRAM_ALPHA_TAG := $(subst .,_,$(NGRAM_BACKOFF_ALPHA))
+PILOT_TAG := $(DATASET)-$(MODEL)-first_$(PILOT_WORDS_PER_TEXT)_per_text-ngram_$(NGRAM_CONTEXT_TAG)-context_$(CONTEXT_TAG)
+
+PILOT_CHECKPOINT_DIR := $(CHECKPOINT_DIR)/joint_pilot/$(PILOT_TAG)
+PILOT_RESULTS_DIR := $(RESULTS_DIR)/joint_pilot/$(PILOT_TAG)
+PILOT_TEXT_FILE := $(PILOT_CHECKPOINT_DIR)/text.txt
+PILOT_NGRAM_FILE := $(PILOT_CHECKPOINT_DIR)/ngram.tsv
+PILOT_CONTEXT_FILE := $(PILOT_CHECKPOINT_DIR)/context-limited.tsv
+PILOT_DATA_FILE := $(PILOT_CHECKPOINT_DIR)/joint-data.tsv
+PILOT_FOLD_FILE := $(PILOT_RESULTS_DIR)/fold-results.tsv
+PILOT_A_PIVOT_FILE := $(PILOT_RESULTS_DIR)/delta-a-given-b-mean.tsv
+PILOT_B_PIVOT_FILE := $(PILOT_RESULTS_DIR)/delta-b-given-a-mean.tsv
+PILOT_A_SE_FILE := $(PILOT_RESULTS_DIR)/delta-a-given-b-se.tsv
+PILOT_B_SE_FILE := $(PILOT_RESULTS_DIR)/delta-b-given-a-se.tsv
+PILOT_SUMMARY_FILE := $(PILOT_RESULTS_DIR)/summary.tsv
+
+.PHONY: joint_pilot joint_pilot_data
+joint_pilot: $(PILOT_SUMMARY_FILE)
+	@echo "Joint pilot complete: $(PILOT_RESULTS_DIR)"
+
+joint_pilot_data: $(PILOT_DATA_FILE)
+
+# Delegate established full-context scoring and RT/control preparation to the
+# original pipeline only when its merged checkpoint is absent.
+$(BASE_MERGED_FILE):
+	$(MAKE) -f Makefile DATASET=$(DATASET) MODEL=$(MODEL) process_data
+
+$(PILOT_TEXT_FILE): $(FULL_TEXT_FILE) src/h01_data/create_joint_pilot_text.py
+	mkdir -p $(PILOT_CHECKPOINT_DIR)
+	python src/h01_data/create_joint_pilot_text.py \
+		--input-fname $(FULL_TEXT_FILE) \
+		--output-fname $(PILOT_TEXT_FILE) \
+		--words-per-text $(PILOT_WORDS_PER_TEXT)
+
+$(PILOT_NGRAM_FILE): $(PILOT_TEXT_FILE) src/h01_data/get_ngram_surprisals.py
+	mkdir -p $(PILOT_CHECKPOINT_DIR) .cache/ngram_count_cache $(NGRAM_TOKENIZER_CACHE_DIR)
+	python src/h01_data/get_ngram_surprisals.py \
+		--input-fname $(PILOT_TEXT_FILE) \
+		--output-fname $(PILOT_NGRAM_FILE) \
+		--cache-fname $(NGRAM_CACHE_FILE) \
+		--index $(NGRAM_INDEX) \
+		--context-lengths $(NGRAM_CONTEXT_LENGTHS) \
+		--backoff-alpha $(NGRAM_BACKOFF_ALPHA) \
+		--api-url $(NGRAM_API_URL) \
+		--tokenizer $(NGRAM_TOKENIZER) \
+		--tokenizer-revision $(NGRAM_TOKENIZER_REVISION) \
+		--tokenizer-cache-dir $(NGRAM_TOKENIZER_CACHE_DIR) \
+		--workers $(NGRAM_WORKERS) \
+		--timeout $(NGRAM_TIMEOUT) \
+		--max-retries $(NGRAM_MAX_RETRIES)
+
+$(PILOT_CONTEXT_FILE): $(PILOT_TEXT_FILE) src/h01_data/get_context_limited_surprisals.py
+	mkdir -p $(PILOT_CHECKPOINT_DIR)
+	python src/h01_data/get_context_limited_surprisals.py \
+		--input-fname $(PILOT_TEXT_FILE) \
+		--output-fname $(PILOT_CONTEXT_FILE) \
+		--model $(MODEL) \
+		--context-lengths $(CONTEXT_LIMITED_CONTEXT_LENGTHS) \
+		--batch-size $(CONTEXT_LIMITED_BATCH_SIZE)
+
+$(PILOT_DATA_FILE): $(BASE_MERGED_FILE) $(PILOT_NGRAM_FILE) $(PILOT_CONTEXT_FILE) \
+                    src/h01_data/build_joint_pilot_dataset.py
+	python src/h01_data/build_joint_pilot_dataset.py \
+		--base-merged-fname $(BASE_MERGED_FILE) \
+		--ngram-surprisal-fname $(PILOT_NGRAM_FILE) \
+		--context-limited-surprisal-fname $(PILOT_CONTEXT_FILE) \
+		--output-fname $(PILOT_DATA_FILE)
+
+# The evaluator writes every result atomically and writes summary.tsv last.
+$(PILOT_SUMMARY_FILE): $(PILOT_DATA_FILE) src/h02_rt_model/rt_vs_joint_pilot_surprisal.R
+	mkdir -p $(PILOT_RESULTS_DIR)
+	Rscript src/h02_rt_model/rt_vs_joint_pilot_surprisal.R \
+		$(PILOT_DATA_FILE) $(PILOT_FOLD_FILE) \
+		$(PILOT_A_PIVOT_FILE) $(PILOT_B_PIVOT_FILE) \
+		$(PILOT_A_SE_FILE) $(PILOT_B_SE_FILE) $(PILOT_SUMMARY_FILE) \
+		$(PILOT_FOLDS) $(PILOT_SEED)
