@@ -62,11 +62,16 @@ JOINT_FULL_B_SE_FILE := $(JOINT_FULL_RESULTS_DIR)/delta-b-given-a-se.tsv
 JOINT_FULL_SUMMARY_FILE := $(JOINT_FULL_RESULTS_DIR)/summary.tsv
 NGRAM_CACHE_FILE := $(NGRAM_CACHE_DIR)/$(NGRAM_INDEX_TAG).sqlite
 
-.PHONY: joint_full joint_full_data
+.PHONY: joint_full joint_full_data joint_full_context_surprisals
 joint_full: $(JOINT_FULL_SUMMARY_FILE)
 	@echo "Joint full experiment complete: $(JOINT_FULL_RESULTS_DIR)"
 
 joint_full_data: $(JOINT_FULL_DATA_FILE)
+
+# Generate only the model-specific fixed-context predictor.  This entry point
+# intentionally avoids the n-gram, joint merge, full-context LM, and R stages.
+joint_full_context_surprisals: $(JOINT_FULL_CONTEXT_FILE)
+	@echo "Context-limited surprisals complete: $(JOINT_FULL_CONTEXT_FILE)"
 
 # The original stage recipes rely on process_data to impose their ordering.
 # Add the missing file dependencies here so this entry point also works from a

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
+import sys
 import tempfile
 
 
@@ -212,6 +213,28 @@ def load_wordsprobability_model(model_name):
             f"missing: {', '.join(missing)}"
         )
     return wrapper
+
+
+def log_model_runtime(model_name, wrapper):
+    """Record the loaded precision/device so checkpoints remain auditable."""
+
+    model = wrapper.model
+    try:
+        first_parameter = next(model.parameters())
+        parameter_count = sum(parameter.numel() for parameter in model.parameters())
+        print(
+            "CONTEXT-LIMITED model "
+            f"name={model_name} parameters={parameter_count} "
+            f"dtype={first_parameter.dtype} device={first_parameter.device}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except (AttributeError, StopIteration):
+        print(
+            f"CONTEXT-LIMITED model name={model_name} runtime metadata unavailable",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _model_max_positions(model):
@@ -469,6 +492,7 @@ def main():
     context_lengths = validate_options(args.context_lengths, args.batch_size)
     texts = read_texts(args.input_fname)
     wrapper = load_wordsprobability_model(args.model)
+    log_model_runtime(args.model, wrapper)
     rows = build_rows(texts, context_lengths, wrapper, args.batch_size)
     write_rows_atomic(rows, args.output_fname, context_lengths)
 
