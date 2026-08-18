@@ -1,0 +1,148 @@
+# Canonical full-corpus comparison of n-gram (N), context-limited (C), and
+# GPT-2-small internal-layer (L) surprisal for Natural Stories.
+.DEFAULT_GOAL := layer_full
+
+PYTHON ?= python
+RSCRIPT ?= Rscript
+
+DATASET ?= natural_stories
+MODEL ?= gpt2-small
+ifneq ($(DATASET),natural_stories)
+$(error MakefileLayerFull supports only DATASET=natural_stories)
+endif
+ifneq ($(MODEL),gpt2-small)
+$(error MakefileLayerFull supports only MODEL=gpt2-small)
+endif
+
+LAYER_FOLDS ?= 10
+LAYER_SEED ?= 42
+FINAL_LAYER_ANCHOR_TOLERANCE ?= 0.0005
+
+CHECKPOINT_DIR ?= checkpoints/rt
+RESULTS_DIR ?= results/rt
+
+# This experiment is intentionally fixed to the definitive N+C configuration.
+# In particular, do not regenerate the base RT table: its local provenance is
+# known to differ from the canonical full-run artifact.
+CANONICAL_JOINT_TAG := natural_stories-gpt2-small-ngram_v4_piletrain_llama-contexts_0-1-2-3-4-alpha_0_4-context_1-2-3-4
+CANONICAL_JOINT_DIR := $(CHECKPOINT_DIR)/joint_full/$(CANONICAL_JOINT_TAG)
+CANONICAL_JOINT_FILE := $(CANONICAL_JOINT_DIR)/joint-data.tsv
+CANONICAL_REFERENCE_FILE := $(CHECKPOINT_DIR)/surprisals_rt_data/suprisal-natural_stories-gpt2-small.tsv
+FULL_TEXT_FILE := $(CHECKPOINT_DIR)/text_rt_data/natural_stories.txt
+
+# Keep costly predictor identity separate from cheap analysis identity so a
+# folds/seed change reuses the same full-corpus layer checkpoint.
+INTERNAL_LAYER_IDS := 1 2 3 4 5 6 7 8 9 10 11 12
+INTERNAL_FINAL_LAYER := 12
+LAYER_CHECKPOINT_TAG := natural_stories-gpt2-small-layers_1-12-logit-lens
+LAYER_ANALYSIS_TAG := folds_$(LAYER_FOLDS)-seed_$(LAYER_SEED)
+SMOKE_CHECKPOINT_TAG := natural_stories-gpt2-small-layer_12-anchor-smoke
+
+LAYER_CHECKPOINT_DIR := $(CHECKPOINT_DIR)/layer_full/$(LAYER_CHECKPOINT_TAG)
+LAYER_RESULTS_DIR := $(RESULTS_DIR)/layer_full/$(LAYER_CHECKPOINT_TAG)/$(LAYER_ANALYSIS_TAG)
+PASSAGE_CHECKPOINT_DIR := $(LAYER_CHECKPOINT_DIR)/passage-checkpoints
+LAYER_FILE := $(LAYER_CHECKPOINT_DIR)/internal-layer.tsv
+LAYER_ANCHOR_JSON := $(LAYER_FILE).anchor.json
+LAYER_DATA_FILE := $(LAYER_CHECKPOINT_DIR)/joint-data.tsv
+LAYER_FOLD_FILE := $(LAYER_RESULTS_DIR)/fold-results.tsv
+LAYER_DELTA_FILE := $(LAYER_RESULTS_DIR)/conditional-deltas.tsv
+LAYER_SUMMARY_FILE := $(LAYER_RESULTS_DIR)/summary.tsv
+LAYER_COMPLETION_FILE := $(LAYER_RESULTS_DIR)/validation-complete.json
+
+SMOKE_CHECKPOINT_DIR := $(CHECKPOINT_DIR)/layer_full/$(SMOKE_CHECKPOINT_TAG)
+SMOKE_PASSAGE_CHECKPOINT_DIR := $(SMOKE_CHECKPOINT_DIR)/passage-checkpoints
+SMOKE_LAYER_FILE := $(SMOKE_CHECKPOINT_DIR)/internal-layer.tsv
+SMOKE_ANCHOR_JSON := $(SMOKE_LAYER_FILE).anchor.json
+
+LAYER_VALIDATOR := scripts/validate_layer_full_outputs.py
+
+.PHONY: layer_full layer_full_anchor_smoke layer_full_surprisals \
+        layer_full_data layer_full_analysis layer_full_validate
+
+# Validation is deliberately phony: every invocation rechecks hashes and table
+# invariants before reporting completion.  The validator alone publishes the
+# completion JSON atomically; Make never creates an unchecked sentinel.
+layer_full: layer_full_anchor_smoke layer_full_validate
+	@echo "Canonical full layer experiment complete: $(LAYER_RESULTS_DIR)"
+
+layer_full_anchor_smoke: $(SMOKE_LAYER_FILE) $(SMOKE_ANCHOR_JSON)
+	@echo "Full-corpus layer-12 anchor smoke passed: $(SMOKE_CHECKPOINT_DIR)"
+
+layer_full_surprisals: $(LAYER_FILE) $(LAYER_ANCHOR_JSON)
+
+layer_full_data: $(LAYER_DATA_FILE)
+
+layer_full_analysis: $(LAYER_FOLD_FILE) $(LAYER_DELTA_FILE) $(LAYER_SUMMARY_FILE)
+
+layer_full_validate: $(LAYER_FILE) $(LAYER_ANCHOR_JSON) $(LAYER_DATA_FILE) \
+                     $(LAYER_FOLD_FILE) $(LAYER_DELTA_FILE) \
+                     $(LAYER_SUMMARY_FILE) $(LAYER_VALIDATOR)
+	$(PYTHON) $(LAYER_VALIDATOR) \
+		--canonical-joint-fname "$(CANONICAL_JOINT_FILE)" \
+		--internal-layer-fname "$(LAYER_FILE)" \
+		--merged-data-fname "$(LAYER_DATA_FILE)" \
+		--summary-fname "$(LAYER_SUMMARY_FILE)" \
+		--fold-results-fname "$(LAYER_FOLD_FILE)" \
+		--conditional-deltas-fname "$(LAYER_DELTA_FILE)" \
+		--anchor-json-fname "$(LAYER_ANCHOR_JSON)" \
+		--completion-json-fname "$(LAYER_COMPLETION_FILE)" \
+		--expected-rows 10256 \
+		--expected-complete-rows 10023 \
+		--expected-excluded-rows 233 \
+		--expected-folds $(LAYER_FOLDS) \
+		--expected-seed $(LAYER_SEED) \
+		--expected-final-layer $(INTERNAL_FINAL_LAYER) \
+		--expected-model $(MODEL)
+
+# This one-head, full-text run fails before the twelve-head run if the cluster
+# snapshot, numeric backend, or chunk seams disagree with the canonical scores.
+$(SMOKE_LAYER_FILE) $(SMOKE_ANCHOR_JSON) &: $(FULL_TEXT_FILE) $(CANONICAL_REFERENCE_FILE) \
+                                            src/h01_data/get_internal_layer_surprisals.py \
+                                            src/h01_data/get_context_limited_surprisals.py
+	mkdir -p "$(SMOKE_CHECKPOINT_DIR)" "$(SMOKE_PASSAGE_CHECKPOINT_DIR)"
+	$(PYTHON) src/h01_data/get_internal_layer_surprisals.py \
+		--input-fname "$(FULL_TEXT_FILE)" \
+		--output-fname "$(SMOKE_LAYER_FILE)" \
+		--model $(MODEL) \
+		--layers $(INTERNAL_FINAL_LAYER) \
+		--passage-checkpoint-dir "$(SMOKE_PASSAGE_CHECKPOINT_DIR)" \
+		--reference-surprisal-fname "$(CANONICAL_REFERENCE_FILE)" \
+		--anchor-tolerance $(FINAL_LAYER_ANCHOR_TOLERANCE)
+
+$(LAYER_FILE) $(LAYER_ANCHOR_JSON) &: $(FULL_TEXT_FILE) $(CANONICAL_REFERENCE_FILE) \
+                                      src/h01_data/get_internal_layer_surprisals.py \
+                                      src/h01_data/get_context_limited_surprisals.py \
+                                      | $(SMOKE_LAYER_FILE) $(SMOKE_ANCHOR_JSON)
+	mkdir -p "$(LAYER_CHECKPOINT_DIR)" "$(PASSAGE_CHECKPOINT_DIR)"
+	$(PYTHON) src/h01_data/get_internal_layer_surprisals.py \
+		--input-fname "$(FULL_TEXT_FILE)" \
+		--output-fname "$(LAYER_FILE)" \
+		--model $(MODEL) \
+		--layers $(INTERNAL_LAYER_IDS) \
+		--passage-checkpoint-dir "$(PASSAGE_CHECKPOINT_DIR)" \
+		--reference-surprisal-fname "$(CANONICAL_REFERENCE_FILE)" \
+		--anchor-tolerance $(FINAL_LAYER_ANCHOR_TOLERANCE)
+
+$(LAYER_DATA_FILE): $(CANONICAL_JOINT_FILE) $(LAYER_FILE) $(LAYER_ANCHOR_JSON) \
+                    src/h01_data/build_layer_comparison_dataset.py \
+                    src/h01_data/build_joint_pilot_dataset.py
+	mkdir -p "$(LAYER_CHECKPOINT_DIR)"
+	$(PYTHON) src/h01_data/build_layer_comparison_dataset.py \
+		--joint-data-fname "$(CANONICAL_JOINT_FILE)" \
+		--internal-layer-surprisal-fname "$(LAYER_FILE)" \
+		--output-fname "$(LAYER_DATA_FILE)" \
+		--require-exact-joint-coverage \
+		--expected-rows 10256 \
+		--expected-final-layer $(INTERNAL_FINAL_LAYER) \
+		--anchor-tolerance $(FINAL_LAYER_ANCHOR_TOLERANCE)
+
+# The evaluator atomically writes all three result tables.  Grouped targets make
+# deleting any side output trigger regeneration on the next invocation.
+$(LAYER_FOLD_FILE) $(LAYER_DELTA_FILE) $(LAYER_SUMMARY_FILE) &: $(LAYER_DATA_FILE) \
+                       src/h02_rt_model/rt_vs_internal_layer_surprisal.R \
+                       src/h02_rt_model/rt_vs_joint_pilot_surprisal.R
+	mkdir -p "$(LAYER_RESULTS_DIR)"
+	$(RSCRIPT) src/h02_rt_model/rt_vs_internal_layer_surprisal.R \
+		"$(LAYER_DATA_FILE)" "$(LAYER_FOLD_FILE)" \
+		"$(LAYER_DELTA_FILE)" "$(LAYER_SUMMARY_FILE)" \
+		$(LAYER_FOLDS) $(LAYER_SEED) $(MODEL)

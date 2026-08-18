@@ -1,0 +1,15 @@
+key	value
+input_rows	500
+complete_case_rows	454
+excluded_rows	46
+folds	10
+seed	42
+response	raw reading time (ms)
+delta_unit	mean held-out log density per observation
+ngram_contexts	0,1,2,3,4
+context_limited_contexts	1,2,3,4
+internal_layers	1,2,3,4,5,6,7,8,9,10,11,12
+layer_decoder	logit lens
+layer_context	passage prefix (BOS at passage start)
+layer_chunking	wordsprobability 0.17: 1022 encoded tokens, stride 200
+controls	word_len*freq + prev_word_len*prev_freq + prev2_word_len*prev2_freq + prev3_word_len*prev3_freq

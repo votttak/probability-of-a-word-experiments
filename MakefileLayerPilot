@@ -1,0 +1,89 @@
+# Paired pilot for n-gram (N), context-limited (C), and internal-layer (L)
+# surprisal.  The canonical full N+C table is subset without being modified.
+.DEFAULT_GOAL := layer_pilot
+
+DATASET ?= natural_stories
+MODEL ?= gpt2-small
+PILOT_WORDS_PER_TEXT ?= 50
+PILOT_FOLDS ?= 10
+PILOT_SEED ?= 42
+
+NGRAM_INDEX ?= v4_piletrain_llama
+NGRAM_CONTEXT_LENGTHS ?= 0 1 2 3 4
+NGRAM_BACKOFF_ALPHA ?= 0.4
+CONTEXT_LIMITED_CONTEXT_LENGTHS ?= 1 2 3 4
+
+# Hidden-state index 0 is the embedding output; the final index is the
+# ordinary model output.  Empty means all available indices.
+INTERNAL_LAYER_IDS ?=
+INTERNAL_FINAL_LAYER ?= 12
+FINAL_LAYER_ANCHOR_TOLERANCE ?= 0.0005
+
+CHECKPOINT_DIR ?= checkpoints/rt
+RESULTS_DIR ?= results/rt
+FULL_TEXT_FILE := $(CHECKPOINT_DIR)/text_rt_data/$(DATASET).txt
+
+layer_empty :=
+layer_space := $(layer_empty) $(layer_empty)
+NGRAM_CONTEXT_TAG := $(subst $(layer_space),-,$(strip $(NGRAM_CONTEXT_LENGTHS)))
+CONTEXT_TAG := $(subst $(layer_space),-,$(strip $(CONTEXT_LIMITED_CONTEXT_LENGTHS)))
+NGRAM_ALPHA_TAG := $(subst .,_,$(NGRAM_BACKOFF_ALPHA))
+INTERNAL_LAYER_TAG := $(if $(strip $(INTERNAL_LAYER_IDS)),$(subst $(layer_space),-,$(strip $(INTERNAL_LAYER_IDS))),all)
+INTERNAL_LAYER_ARGS := $(if $(strip $(INTERNAL_LAYER_IDS)),--layers $(INTERNAL_LAYER_IDS),)
+
+# Reuse the canonical N+C+RT/control table.  This avoids the known local/base
+# RT mismatch documented in the semester experiment record.
+CANONICAL_JOINT_TAG := $(DATASET)-$(MODEL)-ngram_$(NGRAM_INDEX)-contexts_$(NGRAM_CONTEXT_TAG)-alpha_$(NGRAM_ALPHA_TAG)-context_$(CONTEXT_TAG)
+CANONICAL_JOINT_FILE ?= $(CHECKPOINT_DIR)/joint_full/$(CANONICAL_JOINT_TAG)/joint-data.tsv
+
+LAYER_PILOT_TAG := $(DATASET)-$(MODEL)-first_$(PILOT_WORDS_PER_TEXT)_per_text-ngram_$(NGRAM_INDEX)-contexts_$(NGRAM_CONTEXT_TAG)-alpha_$(NGRAM_ALPHA_TAG)-context_$(CONTEXT_TAG)-layers_$(INTERNAL_LAYER_TAG)-logit_lens-folds_$(PILOT_FOLDS)-seed_$(PILOT_SEED)
+LAYER_CHECKPOINT_DIR := $(CHECKPOINT_DIR)/layer_pilot/$(LAYER_PILOT_TAG)
+LAYER_RESULTS_DIR := $(RESULTS_DIR)/layer_pilot/$(LAYER_PILOT_TAG)
+PILOT_TEXT_FILE := $(LAYER_CHECKPOINT_DIR)/text.txt
+PILOT_LAYER_FILE := $(LAYER_CHECKPOINT_DIR)/internal-layer.tsv
+PILOT_DATA_FILE := $(LAYER_CHECKPOINT_DIR)/joint-data.tsv
+PILOT_FOLD_FILE := $(LAYER_RESULTS_DIR)/fold-results.tsv
+PILOT_DELTA_FILE := $(LAYER_RESULTS_DIR)/conditional-deltas.tsv
+PILOT_SUMMARY_FILE := $(LAYER_RESULTS_DIR)/summary.tsv
+
+.PHONY: layer_pilot layer_pilot_data
+layer_pilot: $(PILOT_SUMMARY_FILE)
+	@echo "Layer pilot complete: $(LAYER_RESULTS_DIR)"
+
+layer_pilot_data: $(PILOT_DATA_FILE)
+
+$(PILOT_TEXT_FILE): $(FULL_TEXT_FILE) src/h01_data/create_joint_pilot_text.py
+	mkdir -p $(LAYER_CHECKPOINT_DIR)
+	python src/h01_data/create_joint_pilot_text.py \
+		--input-fname $(FULL_TEXT_FILE) \
+		--output-fname $(PILOT_TEXT_FILE) \
+		--words-per-text $(PILOT_WORDS_PER_TEXT)
+
+$(PILOT_LAYER_FILE): $(PILOT_TEXT_FILE) \
+                     src/h01_data/get_internal_layer_surprisals.py \
+                     src/h01_data/get_context_limited_surprisals.py
+	mkdir -p $(LAYER_CHECKPOINT_DIR)
+	python src/h01_data/get_internal_layer_surprisals.py \
+		--input-fname $(PILOT_TEXT_FILE) \
+		--output-fname $(PILOT_LAYER_FILE) \
+		--model $(MODEL) $(INTERNAL_LAYER_ARGS)
+
+$(PILOT_DATA_FILE): $(CANONICAL_JOINT_FILE) $(PILOT_LAYER_FILE) \
+                    src/h01_data/build_layer_comparison_dataset.py \
+                    src/h01_data/build_joint_pilot_dataset.py
+	python src/h01_data/build_layer_comparison_dataset.py \
+		--joint-data-fname $(CANONICAL_JOINT_FILE) \
+		--internal-layer-surprisal-fname $(PILOT_LAYER_FILE) \
+		--output-fname $(PILOT_DATA_FILE) \
+		--expected-final-layer $(INTERNAL_FINAL_LAYER) \
+		--anchor-tolerance $(FINAL_LAYER_ANCHOR_TOLERANCE)
+
+# The evaluator writes summary.tsv last, after both result tables are complete.
+$(PILOT_SUMMARY_FILE): $(PILOT_DATA_FILE) \
+                       src/h02_rt_model/rt_vs_internal_layer_surprisal.R \
+                       src/h02_rt_model/rt_vs_joint_pilot_surprisal.R
+	mkdir -p $(LAYER_RESULTS_DIR)
+	Rscript src/h02_rt_model/rt_vs_internal_layer_surprisal.R \
+		$(PILOT_DATA_FILE) $(PILOT_FOLD_FILE) \
+		$(PILOT_DELTA_FILE) $(PILOT_SUMMARY_FILE) \
+		$(PILOT_FOLDS) $(PILOT_SEED) $(MODEL)
