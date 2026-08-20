@@ -197,7 +197,7 @@ if [[ ${REFERENCE_POLICY} == tracked ]]; then
     MODEL_REFERENCE_FILE=${INPUT_CHECKPOINT_DIR}/surprisals_rt_data/suprisal-natural_stories-gpt2-small.tsv
     MODEL_JOINT_FILE=${DEFINITIVE_JOINT_FILE}
 elif [[ ${REFERENCE_POLICY} == fresh ]]; then
-    MODEL_REFERENCE_FILE=${CHECKPOINT_DIR}/layer_full/natural_stories-${MODEL}-ordinary-reference/suprisal-natural_stories-${MODEL}.tsv
+    MODEL_REFERENCE_FILE=${CHECKPOINT_DIR}/layer_full/natural_stories-${MODEL}-ordinary-reference/surprisal-natural_stories-${MODEL}.tsv
     MODEL_JOINT_FILE=${CHECKPOINT_DIR}/joint_full/${MODEL_TAG}/joint-data.tsv
 else
     fail "Unsupported registry reference policy for ${MODEL}: ${REFERENCE_POLICY}"

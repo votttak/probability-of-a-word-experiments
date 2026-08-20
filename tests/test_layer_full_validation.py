@@ -46,6 +46,24 @@ class LayerFullValidationTest(unittest.TestCase):
         )
         self.assertNotIn("pythia-120b", MODEL_FINAL_LAYERS)
 
+    def test_runner_fresh_reference_path_matches_makefile(self):
+        repository = Path(__file__).resolve().parents[1]
+        runner = (repository / "scripts" / "run_layer_full.sh").read_text(
+            encoding="utf8"
+        )
+        makefile = (repository / "MakefileLayerFull").read_text(encoding="utf8")
+        fresh_basename = "surprisal-natural_stories-${MODEL}.tsv"
+
+        self.assertIn(
+            f"ordinary-reference/{fresh_basename}",
+            runner,
+        )
+        self.assertIn(
+            "FRESH_REFERENCE_FILE := "
+            "$(FRESH_REFERENCE_DIR)/surprisal-natural_stories-$(MODEL).tsv",
+            makefile,
+        )
+
     @staticmethod
     def _with_shifts(dataframe, columns):
         dataframe = dataframe.copy()
