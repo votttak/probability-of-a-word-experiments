@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from scripts.wordsprobability_cuda_compat import (
+    _get_surprisal_without_dtype_assert,
     _move_vocab_masks_to_model_device,
     cuda_safe_concatenate,
 )
@@ -37,6 +38,25 @@ class WordsprobabilityCudaCompatTests(unittest.TestCase):
 
         self.assertEqual(model.vocab_masks["bow"].device, model.device)
         self.assertEqual(model.vocab_masks["metadata"], "unchanged")
+
+    def test_surprisal_ignores_mixed_dtype_diagnostic_loss(self):
+        logits = torch.tensor(
+            [[[1.0, 2.0, 3.0], [3.0, 1.0, 2.0]]],
+            dtype=torch.float16,
+        )
+        labels = torch.tensor([[2, 0]])
+        output = {"loss": torch.tensor(0.0, dtype=torch.float32)}
+
+        observed = _get_surprisal_without_dtype_assert(
+            logits, labels, output, labels
+        )
+        expected = torch.nn.functional.cross_entropy(
+            logits.view(-1, 3),
+            labels.view(-1),
+            reduction="none",
+        ).numpy()
+
+        np.testing.assert_array_equal(observed, expected)
 
 
 if __name__ == "__main__":

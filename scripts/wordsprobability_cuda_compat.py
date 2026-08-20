@@ -14,6 +14,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 _NUMPY_CONCATENATE = np.concatenate
@@ -42,11 +43,26 @@ def _move_vocab_masks_to_model_device(model: Any) -> None:
     }
 
 
+def _get_surprisal_without_dtype_assert(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    _output: Any,
+    _tensor_input: torch.Tensor,
+) -> np.ndarray:
+    surprisals = F.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        labels.view(-1),
+        reduction="none",
+    )
+    return surprisals.detach().cpu().numpy()
+
+
 def main() -> int:
     from wordsprobability.models.bow_lm import BaseBOWModel
 
     original = np.concatenate
     original_mask_initializer = BaseBOWModel._initialise_vocab_masks
+    original_surprisal = BaseBOWModel._get_surprisal
 
     def initialise_device_safe_vocab_masks(model: Any) -> None:
         original_mask_initializer(model)
@@ -54,12 +70,14 @@ def main() -> int:
 
     np.concatenate = cuda_safe_concatenate
     BaseBOWModel._initialise_vocab_masks = initialise_device_safe_vocab_masks
+    BaseBOWModel._get_surprisal = staticmethod(_get_surprisal_without_dtype_assert)
     try:
         from wordsprobability.main import main as wordsprobability_main
 
         result = wordsprobability_main()
         return 0 if result is None else int(result)
     finally:
+        BaseBOWModel._get_surprisal = staticmethod(original_surprisal)
         BaseBOWModel._initialise_vocab_masks = original_mask_initializer
         np.concatenate = original
 
