@@ -4,7 +4,7 @@
 
 PYTHON ?= python
 RSCRIPT ?= Rscript
-WORDSPROBABILITY ?= wordsprobability
+WORDSPROBABILITY ?= $(PYTHON) scripts/wordsprobability_cuda_compat.py
 
 DATASET ?= natural_stories
 MODEL ?= gpt2-small
@@ -116,7 +116,7 @@ $(PILOT_TEXT_FILE): $(FULL_TEXT_FILE) src/h01_data/create_joint_pilot_text.py
 
 # wordsprobability does not publish atomically itself. Write beside the target
 # and rename only after a complete model-specific pilot reference is available.
-$(PILOT_REFERENCE_FILE): $(PILOT_TEXT_FILE)
+$(PILOT_REFERENCE_FILE): $(PILOT_TEXT_FILE) scripts/wordsprobability_cuda_compat.py
 	mkdir -p "$(LAYER_CHECKPOINT_DIR)"
 	@set -eu; \
 	temporary_fname="$@.tmp.$$$$"; \

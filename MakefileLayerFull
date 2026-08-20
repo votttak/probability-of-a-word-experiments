@@ -4,7 +4,7 @@
 
 PYTHON ?= python
 RSCRIPT ?= Rscript
-WORDSPROBABILITY ?= wordsprobability
+WORDSPROBABILITY ?= $(PYTHON) scripts/wordsprobability_cuda_compat.py
 
 DATASET ?= natural_stories
 MODEL ?= gpt2-small
@@ -145,7 +145,7 @@ ifeq ($(REFERENCE_POLICY),fresh)
 # The old tracked non-small references are not used: ordinary scores are
 # regenerated with the same selected runtime/model snapshot as L.  Publish the
 # result only after wordsprobability has completed the whole corpus.
-$(MODEL_REFERENCE_FILE): $(FULL_TEXT_FILE)
+$(MODEL_REFERENCE_FILE): $(FULL_TEXT_FILE) scripts/wordsprobability_cuda_compat.py
 	mkdir -p "$(FRESH_REFERENCE_DIR)"
 	@set -eu; \
 		temporary="$@.tmp.$$$$"; \
