@@ -19,7 +19,7 @@ from typing import Iterable
 
 
 GPT2_ANCHOR_TOLERANCE = 5e-4
-PYTHIA_ANCHOR_TOLERANCE = 1e-2
+PYTHIA_ANCHOR_TOLERANCE = 5e-4
 
 
 @dataclass(frozen=True)
@@ -45,9 +45,10 @@ class InternalLayerModel:
 # must generate an ordinary-surprisal reference from the same runtime and model
 # snapshot immediately before L scoring.
 #
-# Pythia's 0.01 tolerance is strictly a numerical gate between stable-float32 L
-# and a fresh native-FP16 wordsprobability reference.  It does not permit using
-# the old tracked Pythia references, whose measured cross-runtime drift is huge.
+# Fresh Pythia references retain FP16 model inference but use the same stable
+# float32 log-space token and boundary reductions as L. This avoids native-FP16
+# boundary underflow and supports the same strict anchor gate as GPT-2. It does
+# not permit using old tracked Pythia references, whose provenance is unknown.
 # Order is intentional: GPT-2 by scale, followed by Pythia by scale.
 MODEL_SPECS = (
     InternalLayerModel(

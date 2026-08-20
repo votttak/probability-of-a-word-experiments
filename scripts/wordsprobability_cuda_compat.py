@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Run wordsprobability 0.17 safely when model outputs live on CUDA.
 
-The package leaves its vocabulary masks on CPU and concatenates NumPy arrays
-with Torch tensors. Both assumptions fail when the model runs on CUDA. Move
-the masks to the model device and convert Torch inputs explicitly at the
-NumPy boundary while leaving model loading and inference on the selected
-device.
+The package leaves its vocabulary masks on CPU, concatenates NumPy arrays
+with Torch tensors, and reduces FP16 probabilities in native precision. Those
+assumptions fail or underflow when Pythia runs on CUDA. Move the masks to the
+model device, use float32 log-space reductions, and convert Torch inputs at
+the NumPy boundary while leaving model loading and inference in the selected
+runtime dtype.
 """
 
 from __future__ import annotations
@@ -43,18 +44,63 @@ def _move_vocab_masks_to_model_device(model: Any) -> None:
     }
 
 
-def _get_surprisal_without_dtype_assert(
+def _get_stable_surprisal(
     logits: torch.Tensor,
     labels: torch.Tensor,
     _output: Any,
     _tensor_input: torch.Tensor,
 ) -> np.ndarray:
-    surprisals = F.cross_entropy(
-        logits.view(-1, logits.size(-1)),
-        labels.view(-1),
-        reduction="none",
+    float_logits = logits.float()
+    log_normalizer = torch.logsumexp(float_logits, dim=-1)
+    target_logits = float_logits.gather(
+        -1, labels.unsqueeze(-1)
+    ).squeeze(-1)
+    surprisals = log_normalizer - target_logits
+    return surprisals.reshape(-1).detach().cpu().numpy()
+
+
+def _stable_weighted_boundary_surprisal(
+    logits: torch.Tensor,
+    weights: torch.Tensor,
+) -> np.ndarray:
+    float_logits = logits.float()
+    log_normalizer = torch.logsumexp(float_logits, dim=-1)
+    positive = weights > 0
+    positive_weights = weights[positive].to(
+        device=float_logits.device,
+        dtype=float_logits.dtype,
     )
-    return surprisals.detach().cpu().numpy()
+    weighted_logits = (
+        float_logits[..., positive] + torch.log(positive_weights)
+    )
+    result = log_normalizer - torch.logsumexp(weighted_logits, dim=-1)
+    return result.reshape(-1).detach().cpu().numpy()
+
+
+def _get_stable_bow_fix(
+    model: Any,
+    logits: torch.Tensor,
+    _labels: torch.Tensor,
+    _output: Any,
+    _tensor_input: torch.Tensor,
+) -> np.ndarray:
+    weights = model.vocab_masks["bow"] + model.vocab_masks["eos"]
+    return _stable_weighted_boundary_surprisal(logits, weights)
+
+
+def _get_stable_bos_fix(
+    model: Any,
+    logits: torch.Tensor,
+    _labels: torch.Tensor,
+    _output: Any,
+    _tensor_input: torch.Tensor,
+) -> np.ndarray:
+    weights = (
+        model.vocab_masks["mid"]
+        + model.vocab_masks["punct"]
+        + model.vocab_masks["eos"]
+    )
+    return _stable_weighted_boundary_surprisal(logits, weights)
 
 
 def main() -> int:
@@ -63,6 +109,8 @@ def main() -> int:
     original = np.concatenate
     original_mask_initializer = BaseBOWModel._initialise_vocab_masks
     original_surprisal = BaseBOWModel._get_surprisal
+    original_bow_fix = BaseBOWModel._get_bow_fix
+    original_bos_fix = BaseBOWModel._get_bos_fix
 
     def initialise_device_safe_vocab_masks(model: Any) -> None:
         original_mask_initializer(model)
@@ -70,13 +118,17 @@ def main() -> int:
 
     np.concatenate = cuda_safe_concatenate
     BaseBOWModel._initialise_vocab_masks = initialise_device_safe_vocab_masks
-    BaseBOWModel._get_surprisal = staticmethod(_get_surprisal_without_dtype_assert)
+    BaseBOWModel._get_surprisal = staticmethod(_get_stable_surprisal)
+    BaseBOWModel._get_bow_fix = _get_stable_bow_fix
+    BaseBOWModel._get_bos_fix = _get_stable_bos_fix
     try:
         from wordsprobability.main import main as wordsprobability_main
 
         result = wordsprobability_main()
         return 0 if result is None else int(result)
     finally:
+        BaseBOWModel._get_bos_fix = original_bos_fix
+        BaseBOWModel._get_bow_fix = original_bow_fix
         BaseBOWModel._get_surprisal = staticmethod(original_surprisal)
         BaseBOWModel._initialise_vocab_masks = original_mask_initializer
         np.concatenate = original

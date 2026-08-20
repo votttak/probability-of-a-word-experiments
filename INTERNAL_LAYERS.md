@@ -18,12 +18,12 @@ models, and transformer-block depths are:
 | `gpt2-medium` | `gpt2-medium` | GPT-2 | 24 | fresh | `0.0005` |
 | `gpt2-large` | `gpt2-large` | GPT-2 | 36 | fresh | `0.0005` |
 | `gpt2-xl` | `gpt2-xl` | GPT-2 | 48 | fresh | `0.0005` |
-| `pythia-70m` | `EleutherAI/pythia-70m` | Pythia | 6 | fresh | `0.01` |
-| `pythia-160m` | `EleutherAI/pythia-160m` | Pythia | 12 | fresh | `0.01` |
-| `pythia-410m` | `EleutherAI/pythia-410m` | Pythia | 24 | fresh | `0.01` |
-| `pythia-14b` | `EleutherAI/pythia-1.4b` | Pythia | 24 | fresh | `0.01` |
-| `pythia-28b` | `EleutherAI/pythia-2.8b` | Pythia | 32 | fresh | `0.01` |
-| `pythia-69b` | `EleutherAI/pythia-6.9b` | Pythia | 32 | fresh | `0.01` |
+| `pythia-70m` | `EleutherAI/pythia-70m` | Pythia | 6 | fresh stable | `0.0005` |
+| `pythia-160m` | `EleutherAI/pythia-160m` | Pythia | 12 | fresh stable | `0.0005` |
+| `pythia-410m` | `EleutherAI/pythia-410m` | Pythia | 24 | fresh stable | `0.0005` |
+| `pythia-14b` | `EleutherAI/pythia-1.4b` | Pythia | 24 | fresh stable | `0.0005` |
+| `pythia-28b` | `EleutherAI/pythia-2.8b` | Pythia | 32 | fresh stable | `0.0005` |
+| `pythia-69b` | `EleutherAI/pythia-6.9b` | Pythia | 32 | fresh stable | `0.0005` |
 
 List or query the registry without loading a model:
 
@@ -38,11 +38,14 @@ snapshot immediately before L scoring.
 
 Do not compare new Pythia L scores with the old tracked Pythia references. A
 pilot found very large cross-runtime/precision drift, so those files are
-provenance-incompatible. The `0.01` Pythia gate is solely a numerical check
-between stable-float32 L and a fresh native-FP16 wordsprobability reference; it
-is not permission to use an old reference. Canonical Make and runner commands
-reject arbitrary tolerance overrides. Pythia 12B is excluded because it has no
-completed C checkpoint and does not fit the current single-16-GB-GPU loader.
+provenance-incompatible. Fresh Pythia references retain FP16 model inference
+but compute token and weighted boundary surprisals with stable float32
+log-space reductions, matching C and L. Native FP16 boundary arithmetic can
+underflow and silently turn valid corrected word surprisals into zero. The
+strict `0.0005` gate checks the stable fresh reference against final-layer L.
+Canonical Make and runner commands reject arbitrary tolerance overrides.
+Pythia 12B is excluded because it has no completed C checkpoint and does not
+fit the current single-16-GB-GPU loader.
 
 ## Method
 

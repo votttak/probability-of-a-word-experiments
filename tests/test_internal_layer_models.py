@@ -24,22 +24,22 @@ EXPECTED_MODELS = {
     "gpt2-large": ("gpt2-large", "gpt2", 36, "fresh", 5e-4),
     "gpt2-xl": ("gpt2-xl", "gpt2", 48, "fresh", 5e-4),
     "pythia-70m": (
-        "EleutherAI/pythia-70m", "pythia", 6, "fresh", 1e-2
+        "EleutherAI/pythia-70m", "pythia", 6, "fresh", 5e-4
     ),
     "pythia-160m": (
-        "EleutherAI/pythia-160m", "pythia", 12, "fresh", 1e-2
+        "EleutherAI/pythia-160m", "pythia", 12, "fresh", 5e-4
     ),
     "pythia-410m": (
-        "EleutherAI/pythia-410m", "pythia", 24, "fresh", 1e-2
+        "EleutherAI/pythia-410m", "pythia", 24, "fresh", 5e-4
     ),
     "pythia-14b": (
-        "EleutherAI/pythia-1.4b", "pythia", 24, "fresh", 1e-2
+        "EleutherAI/pythia-1.4b", "pythia", 24, "fresh", 5e-4
     ),
     "pythia-28b": (
-        "EleutherAI/pythia-2.8b", "pythia", 32, "fresh", 1e-2
+        "EleutherAI/pythia-2.8b", "pythia", 32, "fresh", 5e-4
     ),
     "pythia-69b": (
-        "EleutherAI/pythia-6.9b", "pythia", 32, "fresh", 1e-2
+        "EleutherAI/pythia-6.9b", "pythia", 32, "fresh", 5e-4
     ),
 }
 
@@ -84,7 +84,7 @@ class InternalLayerModelRegistryTest(unittest.TestCase):
             "final_layer": "24",
             "layer_ids": " ".join(str(layer) for layer in range(1, 25)),
             "reference_policy": "fresh",
-            "default_anchor_tolerance": "0.01",
+            "default_anchor_tolerance": "0.0005",
         }
         for field, expected in cases.items():
             with self.subTest(field=field):
