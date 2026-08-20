@@ -11,11 +11,13 @@ import numpy as np
 import pandas as pd
 
 from scripts.preflight_layer_full import (
+    MODEL_FINAL_LAYERS,
     ValidationError,
     run_preflight,
     sha256_file,
 )
 from scripts.validate_layer_full_outputs import validate_outputs
+from src.h01_data.internal_layer_models import MODEL_SPECS
 
 
 class LayerFullValidationTest(unittest.TestCase):
@@ -36,6 +38,13 @@ class LayerFullValidationTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_preflight_model_layers_match_canonical_registry(self):
+        self.assertEqual(
+            MODEL_FINAL_LAYERS,
+            {spec.alias: spec.final_layer for spec in MODEL_SPECS},
+        )
+        self.assertNotIn("pythia-120b", MODEL_FINAL_LAYERS)
 
     @staticmethod
     def _with_shifts(dataframe, columns):
@@ -245,7 +254,7 @@ class LayerFullValidationTest(unittest.TestCase):
             })
         return pd.DataFrame(rows)
 
-    def _validate_outputs(self):
+    def _validate_outputs(self, expected_anchor_tolerance=0.0005):
         return validate_outputs(
             self.joint_fname,
             self.internal_fname,
@@ -261,6 +270,7 @@ class LayerFullValidationTest(unittest.TestCase):
             expected_folds=2,
             expected_seed=42,
             expected_final_layer=12,
+            expected_anchor_tolerance=expected_anchor_tolerance,
         )
 
     def test_preflight_accepts_exact_inputs_and_hashes(self):
@@ -325,6 +335,7 @@ class LayerFullValidationTest(unittest.TestCase):
         self.assertAlmostEqual(
             completion["anchor"]["merged_p99_abs_difference"], 0.0004
         )
+        self.assertEqual(completion["anchor"]["tolerance"], 0.0005)
         written = self.completion_fname.read_bytes()
         second = self._validate_outputs()
         self.assertEqual(completion, second)
@@ -346,6 +357,22 @@ class LayerFullValidationTest(unittest.TestCase):
         folds.to_csv(self.fold_fname, sep="\t", index=False)
         with self.assertRaisesRegex(ValidationError, "combinations are incomplete"):
             self._validate_outputs()
+        self.assertFalse(self.completion_fname.exists())
+
+    def test_output_validation_accepts_pythia_tolerance_and_rejects_mismatch(self):
+        anchor = json.loads(self.anchor_fname.read_text(encoding="utf8"))
+        anchor["tolerance"] = 0.01
+        self.anchor_fname.write_text(json.dumps(anchor), encoding="utf8")
+
+        completion = self._validate_outputs(expected_anchor_tolerance=0.01)
+        self.assertEqual(completion["anchor"]["tolerance"], 0.01)
+
+        self.completion_fname.unlink()
+        with self.assertRaisesRegex(
+            ValidationError,
+            "anchor tolerance is 0.01; expected 0.0005",
+        ):
+            self._validate_outputs(expected_anchor_tolerance=0.0005)
         self.assertFalse(self.completion_fname.exists())
 
         self._write_fixture()

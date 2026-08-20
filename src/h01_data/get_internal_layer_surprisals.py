@@ -22,16 +22,16 @@ import tempfile
 
 try:
     from .get_context_limited_surprisals import (
-        SUPPORTED_MODELS,
         load_wordsprobability_model,
         read_texts,
     )
+    from .internal_layer_models import get_model_spec, model_aliases
 except ImportError:  # Support direct execution from src/h01_data.
     from get_context_limited_surprisals import (
-        SUPPORTED_MODELS,
         load_wordsprobability_model,
         read_texts,
     )
+    from internal_layer_models import get_model_spec, model_aliases
 
 
 PREDICTOR_PREFIX = "internal_layer_surprisal_layer_"
@@ -57,7 +57,7 @@ def parse_args():
     )
     parser.add_argument("--input-fname", required=True)
     parser.add_argument("--output-fname", required=True)
-    parser.add_argument("--model", required=True, choices=SUPPORTED_MODELS)
+    parser.add_argument("--model", required=True, choices=model_aliases())
     parser.add_argument(
         "--layers",
         type=int,
@@ -89,6 +89,19 @@ def model_layer_count(model):
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             return value
     raise RuntimeError("Unable to determine the model's transformer-layer count")
+
+
+def validate_registered_model_layer_count(model_name, model):
+    """Require the loaded config to match the canonical model registry."""
+
+    expected = get_model_spec(model_name).final_layer
+    observed = model_layer_count(model)
+    if observed != expected:
+        raise RuntimeError(
+            f"Loaded model layer-count mismatch for {model_name}: "
+            f"registry expects {expected}, config advertises {observed}"
+        )
+    return observed
 
 
 def validate_layers(model, layers):
@@ -842,6 +855,7 @@ def main():
     args = parse_args()
     texts = read_texts(args.input_fname)
     wrapper = load_wordsprobability_model(args.model)
+    validate_registered_model_layer_count(args.model, wrapper.model)
     layers = validate_layers(wrapper.model, args.layers)
     log_internal_model_runtime(args.model, wrapper)
     print(

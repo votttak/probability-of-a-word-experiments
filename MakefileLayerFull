@@ -1,42 +1,79 @@
 # Canonical full-corpus comparison of n-gram (N), context-limited (C), and
-# GPT-2-small internal-layer (L) surprisal for Natural Stories.
+# internal-layer (L) surprisal for the ten models with completed C predictors.
 .DEFAULT_GOAL := layer_full
 
 PYTHON ?= python
 RSCRIPT ?= Rscript
+WORDSPROBABILITY ?= wordsprobability
 
 DATASET ?= natural_stories
 MODEL ?= gpt2-small
 ifneq ($(DATASET),natural_stories)
 $(error MakefileLayerFull supports only DATASET=natural_stories)
 endif
-ifneq ($(MODEL),gpt2-small)
-$(error MakefileLayerFull supports only MODEL=gpt2-small)
+
+MODEL_REGISTRY := src/h01_data/internal_layer_models.py
+REGISTERED_MODEL := $(strip $(shell $(PYTHON) $(MODEL_REGISTRY) --model "$(MODEL)" --field alias 2>/dev/null))
+ifeq ($(REGISTERED_MODEL),)
+$(error unsupported MODEL=$(MODEL); query $(MODEL_REGISTRY) --list)
+endif
+ifneq ($(REGISTERED_MODEL),$(MODEL))
+$(error registry returned $(REGISTERED_MODEL) for MODEL=$(MODEL))
+endif
+MODEL_HF_NAME := $(strip $(shell $(PYTHON) $(MODEL_REGISTRY) --model "$(MODEL)" --field hf_name))
+MODEL_FAMILY := $(strip $(shell $(PYTHON) $(MODEL_REGISTRY) --model "$(MODEL)" --field family))
+INTERNAL_FINAL_LAYER := $(strip $(shell $(PYTHON) $(MODEL_REGISTRY) --model "$(MODEL)" --field final_layer))
+INTERNAL_LAYER_IDS := $(strip $(shell $(PYTHON) $(MODEL_REGISTRY) --model "$(MODEL)" --field layer_ids))
+REFERENCE_POLICY := $(strip $(shell $(PYTHON) $(MODEL_REGISTRY) --model "$(MODEL)" --field reference_policy))
+DEFAULT_ANCHOR_TOLERANCE := $(strip $(shell $(PYTHON) $(MODEL_REGISTRY) --model "$(MODEL)" --field default_anchor_tolerance))
+ifneq ($(words $(INTERNAL_LAYER_IDS)),$(INTERNAL_FINAL_LAYER))
+$(error registry layer set for $(MODEL) is not the full 1..$(INTERNAL_FINAL_LAYER) range)
+endif
+ifneq ($(lastword $(INTERNAL_LAYER_IDS)),$(INTERNAL_FINAL_LAYER))
+$(error registry layer set for $(MODEL) does not include its final layer)
 endif
 
 LAYER_FOLDS ?= 10
 LAYER_SEED ?= 42
-FINAL_LAYER_ANCHOR_TOLERANCE ?= 0.0005
+FINAL_LAYER_ANCHOR_TOLERANCE ?= $(DEFAULT_ANCHOR_TOLERANCE)
+ifneq ($(FINAL_LAYER_ANCHOR_TOLERANCE),$(DEFAULT_ANCHOR_TOLERANCE))
+$(error canonical MODEL=$(MODEL) requires FINAL_LAYER_ANCHOR_TOLERANCE=$(DEFAULT_ANCHOR_TOLERANCE))
+endif
 
 CHECKPOINT_DIR ?= checkpoints/rt
+INPUT_CHECKPOINT_DIR ?= $(CHECKPOINT_DIR)
 RESULTS_DIR ?= results/rt
 
-# This experiment is intentionally fixed to the definitive N+C configuration.
-# In particular, do not regenerate the base RT table: its local provenance is
-# known to differ from the canonical full-run artifact.
-CANONICAL_JOINT_TAG := natural_stories-gpt2-small-ngram_v4_piletrain_llama-contexts_0-1-2-3-4-alpha_0_4-context_1-2-3-4
-CANONICAL_JOINT_DIR := $(CHECKPOINT_DIR)/joint_full/$(CANONICAL_JOINT_TAG)
-CANONICAL_JOINT_FILE := $(CANONICAL_JOINT_DIR)/joint-data.tsv
-CANONICAL_REFERENCE_FILE := $(CHECKPOINT_DIR)/surprisals_rt_data/suprisal-natural_stories-gpt2-small.tsv
-FULL_TEXT_FILE := $(CHECKPOINT_DIR)/text_rt_data/natural_stories.txt
+# The GPT-2-small joint table is the definitive source of RTs, controls, and
+# common N predictors.  Never regenerate those columns from the discrepant
+# local RT preprocessing path.  Each other model replaces only ordinary and C
+# surprisals (plus their text-bounded spillovers) in a fresh atomic joint file.
+DEFINITIVE_JOINT_TAG := natural_stories-gpt2-small-ngram_v4_piletrain_llama-contexts_0-1-2-3-4-alpha_0_4-context_1-2-3-4
+DEFINITIVE_JOINT_FILE := $(INPUT_CHECKPOINT_DIR)/joint_full/$(DEFINITIVE_JOINT_TAG)/joint-data.tsv
+MODEL_JOINT_TAG := natural_stories-$(MODEL)-ngram_v4_piletrain_llama-contexts_0-1-2-3-4-alpha_0_4-context_1-2-3-4
+MODEL_CONTEXT_FILE := $(INPUT_CHECKPOINT_DIR)/joint_full/$(MODEL_JOINT_TAG)/context-limited.tsv
+MODEL_JOINT_DIR := $(CHECKPOINT_DIR)/joint_full/$(MODEL_JOINT_TAG)
+GENERATED_MODEL_JOINT_FILE := $(MODEL_JOINT_DIR)/joint-data.tsv
+TRACKED_SMALL_REFERENCE_FILE := $(INPUT_CHECKPOINT_DIR)/surprisals_rt_data/suprisal-natural_stories-gpt2-small.tsv
+FRESH_REFERENCE_DIR := $(CHECKPOINT_DIR)/layer_full/natural_stories-$(MODEL)-ordinary-reference
+FRESH_REFERENCE_FILE := $(FRESH_REFERENCE_DIR)/surprisal-natural_stories-$(MODEL).tsv
+FULL_TEXT_FILE := $(INPUT_CHECKPOINT_DIR)/text_rt_data/natural_stories.txt
+
+ifeq ($(REFERENCE_POLICY),tracked)
+MODEL_REFERENCE_FILE := $(TRACKED_SMALL_REFERENCE_FILE)
+CANONICAL_JOINT_FILE := $(DEFINITIVE_JOINT_FILE)
+else ifeq ($(REFERENCE_POLICY),fresh)
+MODEL_REFERENCE_FILE := $(FRESH_REFERENCE_FILE)
+CANONICAL_JOINT_FILE := $(GENERATED_MODEL_JOINT_FILE)
+else
+$(error unsupported reference policy $(REFERENCE_POLICY) for $(MODEL))
+endif
 
 # Keep costly predictor identity separate from cheap analysis identity so a
 # folds/seed change reuses the same full-corpus layer checkpoint.
-INTERNAL_LAYER_IDS := 1 2 3 4 5 6 7 8 9 10 11 12
-INTERNAL_FINAL_LAYER := 12
-LAYER_CHECKPOINT_TAG := natural_stories-gpt2-small-layers_1-12-logit-lens
+LAYER_CHECKPOINT_TAG := natural_stories-$(MODEL)-layers_1-$(INTERNAL_FINAL_LAYER)-logit-lens
 LAYER_ANALYSIS_TAG := folds_$(LAYER_FOLDS)-seed_$(LAYER_SEED)
-SMOKE_CHECKPOINT_TAG := natural_stories-gpt2-small-layer_12-anchor-smoke
+SMOKE_CHECKPOINT_TAG := natural_stories-$(MODEL)-layer_$(INTERNAL_FINAL_LAYER)-anchor-smoke
 
 LAYER_CHECKPOINT_DIR := $(CHECKPOINT_DIR)/layer_full/$(LAYER_CHECKPOINT_TAG)
 LAYER_RESULTS_DIR := $(RESULTS_DIR)/layer_full/$(LAYER_CHECKPOINT_TAG)/$(LAYER_ANALYSIS_TAG)
@@ -55,18 +92,27 @@ SMOKE_LAYER_FILE := $(SMOKE_CHECKPOINT_DIR)/internal-layer.tsv
 SMOKE_ANCHOR_JSON := $(SMOKE_LAYER_FILE).anchor.json
 
 LAYER_VALIDATOR := scripts/validate_layer_full_outputs.py
+MODEL_JOINT_BUILDER := src/h01_data/build_model_joint_dataset.py
 
-.PHONY: layer_full layer_full_anchor_smoke layer_full_surprisals \
-        layer_full_data layer_full_analysis layer_full_validate
+.PHONY: layer_full layer_full_reference layer_full_model_joint \
+        layer_full_anchor_smoke layer_full_surprisals layer_full_data \
+        layer_full_analysis layer_full_validate
 
 # Validation is deliberately phony: every invocation rechecks hashes and table
 # invariants before reporting completion.  The validator alone publishes the
 # completion JSON atomically; Make never creates an unchecked sentinel.
-layer_full: layer_full_anchor_smoke layer_full_validate
+layer_full: layer_full_reference layer_full_model_joint \
+            layer_full_anchor_smoke layer_full_validate
 	@echo "Canonical full layer experiment complete: $(LAYER_RESULTS_DIR)"
 
+layer_full_reference: $(MODEL_REFERENCE_FILE)
+	@echo "Ordinary reference ready: $(MODEL_REFERENCE_FILE)"
+
+layer_full_model_joint: $(CANONICAL_JOINT_FILE)
+	@echo "Model-specific canonical joint ready: $(CANONICAL_JOINT_FILE)"
+
 layer_full_anchor_smoke: $(SMOKE_LAYER_FILE) $(SMOKE_ANCHOR_JSON)
-	@echo "Full-corpus layer-12 anchor smoke passed: $(SMOKE_CHECKPOINT_DIR)"
+	@echo "Full-corpus layer-$(INTERNAL_FINAL_LAYER) anchor smoke passed: $(SMOKE_CHECKPOINT_DIR)"
 
 layer_full_surprisals: $(LAYER_FILE) $(LAYER_ANCHOR_JSON)
 
@@ -92,11 +138,39 @@ layer_full_validate: $(LAYER_FILE) $(LAYER_ANCHOR_JSON) $(LAYER_DATA_FILE) \
 		--expected-folds $(LAYER_FOLDS) \
 		--expected-seed $(LAYER_SEED) \
 		--expected-final-layer $(INTERNAL_FINAL_LAYER) \
+		--expected-anchor-tolerance $(FINAL_LAYER_ANCHOR_TOLERANCE) \
 		--expected-model $(MODEL)
 
-# This one-head, full-text run fails before the twelve-head run if the cluster
+ifeq ($(REFERENCE_POLICY),fresh)
+# The old tracked non-small references are not used: ordinary scores are
+# regenerated with the same selected runtime/model snapshot as L.  Publish the
+# result only after wordsprobability has completed the whole corpus.
+$(MODEL_REFERENCE_FILE): $(FULL_TEXT_FILE)
+	mkdir -p "$(FRESH_REFERENCE_DIR)"
+	@set -eu; \
+		temporary="$@.tmp.$$$$"; \
+		trap 'rm -f "$$temporary"' EXIT HUP INT TERM; \
+		$(WORDSPROBABILITY) --model $(MODEL) \
+			--input "$(FULL_TEXT_FILE)" \
+			--output "$$temporary" \
+			--return-buggy-surprisals; \
+		mv -f "$$temporary" "$@"; \
+		trap - EXIT HUP INT TERM
+
+$(CANONICAL_JOINT_FILE): $(DEFINITIVE_JOINT_FILE) $(MODEL_CONTEXT_FILE) \
+                         $(MODEL_REFERENCE_FILE) $(MODEL_JOINT_BUILDER)
+	mkdir -p "$(MODEL_JOINT_DIR)"
+	$(PYTHON) $(MODEL_JOINT_BUILDER) \
+		--canonical-joint-fname "$(DEFINITIVE_JOINT_FILE)" \
+		--context-limited-surprisal-fname "$(MODEL_CONTEXT_FILE)" \
+		--reference-surprisal-fname "$(MODEL_REFERENCE_FILE)" \
+		--output-fname "$(CANONICAL_JOINT_FILE)" \
+		--expected-rows 10256
+endif
+
+# This one-head, full-text run fails before the all-head run if the cluster
 # snapshot, numeric backend, or chunk seams disagree with the canonical scores.
-$(SMOKE_LAYER_FILE) $(SMOKE_ANCHOR_JSON) &: $(FULL_TEXT_FILE) $(CANONICAL_REFERENCE_FILE) \
+$(SMOKE_LAYER_FILE) $(SMOKE_ANCHOR_JSON) &: $(FULL_TEXT_FILE) $(MODEL_REFERENCE_FILE) \
                                             src/h01_data/get_internal_layer_surprisals.py \
                                             src/h01_data/get_context_limited_surprisals.py
 	mkdir -p "$(SMOKE_CHECKPOINT_DIR)" "$(SMOKE_PASSAGE_CHECKPOINT_DIR)"
@@ -106,10 +180,10 @@ $(SMOKE_LAYER_FILE) $(SMOKE_ANCHOR_JSON) &: $(FULL_TEXT_FILE) $(CANONICAL_REFERE
 		--model $(MODEL) \
 		--layers $(INTERNAL_FINAL_LAYER) \
 		--passage-checkpoint-dir "$(SMOKE_PASSAGE_CHECKPOINT_DIR)" \
-		--reference-surprisal-fname "$(CANONICAL_REFERENCE_FILE)" \
+		--reference-surprisal-fname "$(MODEL_REFERENCE_FILE)" \
 		--anchor-tolerance $(FINAL_LAYER_ANCHOR_TOLERANCE)
 
-$(LAYER_FILE) $(LAYER_ANCHOR_JSON) &: $(FULL_TEXT_FILE) $(CANONICAL_REFERENCE_FILE) \
+$(LAYER_FILE) $(LAYER_ANCHOR_JSON) &: $(FULL_TEXT_FILE) $(MODEL_REFERENCE_FILE) \
                                       src/h01_data/get_internal_layer_surprisals.py \
                                       src/h01_data/get_context_limited_surprisals.py \
                                       | $(SMOKE_LAYER_FILE) $(SMOKE_ANCHOR_JSON)
@@ -120,7 +194,7 @@ $(LAYER_FILE) $(LAYER_ANCHOR_JSON) &: $(FULL_TEXT_FILE) $(CANONICAL_REFERENCE_FI
 		--model $(MODEL) \
 		--layers $(INTERNAL_LAYER_IDS) \
 		--passage-checkpoint-dir "$(PASSAGE_CHECKPOINT_DIR)" \
-		--reference-surprisal-fname "$(CANONICAL_REFERENCE_FILE)" \
+		--reference-surprisal-fname "$(MODEL_REFERENCE_FILE)" \
 		--anchor-tolerance $(FINAL_LAYER_ANCHOR_TOLERANCE)
 
 $(LAYER_DATA_FILE): $(CANONICAL_JOINT_FILE) $(LAYER_FILE) $(LAYER_ANCHOR_JSON) \

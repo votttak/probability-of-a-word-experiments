@@ -1,11 +1,14 @@
 """Pure unit tests for internal-layer chunking, aggregation, and mapping."""
 
+import contextlib
 import csv
+import io
 from pathlib import Path
 from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -18,9 +21,11 @@ from h01_data.get_internal_layer_surprisals import (  # noqa: E402
     build_passage_chunks,
     logit_lens_modules,
     normalized_texts_sha256,
+    parse_args,
     read_passage_checkpoint,
     validate_final_layer_reference,
     validate_layers,
+    validate_registered_model_layer_count,
     weighted_boundary_surprisal,
     write_rows_atomic,
 )
@@ -100,6 +105,19 @@ class InternalLayerChunkTest(unittest.TestCase):
 
 
 class InternalLayerMappingTest(unittest.TestCase):
+    def test_cli_rejects_context_only_pythia_120b(self):
+        argv = [
+            "get_internal_layer_surprisals.py",
+            "--input-fname", "input.txt",
+            "--output-fname", "output.tsv",
+            "--model", "pythia-120b",
+        ]
+        with patch.object(sys, "argv", argv):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    parse_args()
+        self.assertEqual(raised.exception.code, 2)
+
     def test_default_layers_are_block_outputs_only(self):
         model = SimpleNamespace(config=SimpleNamespace(n_layer=12))
         self.assertEqual(validate_layers(model, None), list(range(1, 13)))
@@ -108,6 +126,20 @@ class InternalLayerMappingTest(unittest.TestCase):
             validate_layers(model, [0],)
         with self.assertRaisesRegex(ValueError, "between 1 and 12"):
             validate_layers(model, [13])
+
+    def test_loaded_layer_count_must_match_registry(self):
+        pythia = SimpleNamespace(
+            config=SimpleNamespace(num_hidden_layers=6)
+        )
+        self.assertEqual(
+            validate_registered_model_layer_count("pythia-70m", pythia),
+            6,
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "registry expects 12, config advertises 6",
+        ):
+            validate_registered_model_layer_count("pythia-160m", pythia)
 
     def test_gpt2_and_pythia_logit_lens_modules(self):
         gpt_norm, gpt_head = object(), object()

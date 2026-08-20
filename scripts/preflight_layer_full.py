@@ -10,10 +10,18 @@ import json
 import math
 from pathlib import Path
 import re
+import sys
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from src.h01_data.internal_layer_models import MODEL_SPECS  # noqa: E402
 
 
 EXPECTED_ROWS = 10_256
@@ -23,17 +31,7 @@ CONTEXT_LIMITED_CONTEXTS = tuple(range(1, 5))
 SPILLOVER_PREFIXES = ("", "prev_", "prev2_", "prev3_")
 
 MODEL_FINAL_LAYERS = {
-    "gpt2-small": 12,
-    "gpt2-medium": 24,
-    "gpt2-large": 36,
-    "gpt2-xl": 48,
-    "pythia-70m": 6,
-    "pythia-160m": 12,
-    "pythia-410m": 24,
-    "pythia-14b": 24,
-    "pythia-28b": 32,
-    "pythia-69b": 32,
-    "pythia-120b": 36,
+    spec.alias: spec.final_layer for spec in MODEL_SPECS
 }
 
 NGRAM_PATTERN = re.compile(r"ngram_surprisal_context_(\d+)$")

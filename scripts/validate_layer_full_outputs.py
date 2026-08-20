@@ -44,6 +44,7 @@ EXPECTED_FOLDS = 10
 EXPECTED_SEED = 42
 EXPECTED_FINAL_LAYER = 12
 EXPECTED_MODEL = "gpt2-small"
+EXPECTED_ANCHOR_TOLERANCE = 5e-4
 EXPECTED_LAYERS = tuple(range(1, EXPECTED_FINAL_LAYER + 1))
 
 LAYER_PATTERN = re.compile(r"internal_layer_surprisal_layer_(\d+)$")
@@ -596,7 +597,9 @@ def _scalar_close(actual: float, expected: float, label: str) -> None:
 def validate_anchor(anchor_fname: str | Path, internal: pd.DataFrame,
                     merged: pd.DataFrame,
                     expected_zero_based: list[tuple[int, int, str]],
-                    expected_rows: int, expected_final_layer: int) -> dict:
+                    expected_rows: int, expected_final_layer: int,
+                    expected_anchor_tolerance: float =
+                    EXPECTED_ANCHOR_TOLERANCE) -> dict:
     """Validate scorer-reference and independently recomputed merged anchors."""
 
     report = _load_anchor(anchor_fname)
@@ -625,6 +628,23 @@ def validate_anchor(anchor_fname: str | Path, internal: pd.DataFrame,
         values += (reported_p99,)
     if not all(math.isfinite(value) and value >= 0 for value in values):
         raise ValidationError("anchor tolerance/differences must be finite and nonnegative")
+    if (
+        not math.isfinite(expected_anchor_tolerance)
+        or expected_anchor_tolerance < 0
+    ):
+        raise ValidationError(
+            "expected anchor tolerance must be finite and nonnegative"
+        )
+    if not math.isclose(
+        tolerance,
+        expected_anchor_tolerance,
+        rel_tol=1e-10,
+        abs_tol=1e-12,
+    ):
+        raise ValidationError(
+            f"anchor tolerance is {tolerance}; "
+            f"expected {expected_anchor_tolerance}"
+        )
     if reported_max > tolerance or reported_mean > reported_max + 1e-15:
         raise ValidationError("anchor JSON reports an invalid or failed tolerance check")
     if reported_p99 is not None and reported_p99 > reported_max + 1e-15:
@@ -758,7 +778,9 @@ def validate_outputs(canonical_joint_fname: str | Path,
                      expected_folds: int = EXPECTED_FOLDS,
                      expected_seed: int = EXPECTED_SEED,
                      expected_final_layer: int = EXPECTED_FINAL_LAYER,
-                     expected_model: str = EXPECTED_MODEL) -> dict:
+                     expected_model: str = EXPECTED_MODEL,
+                     expected_anchor_tolerance: float =
+                     EXPECTED_ANCHOR_TOLERANCE) -> dict:
     """Validate the full output set, then atomically publish its manifest."""
 
     expected_layers = tuple(range(1, expected_final_layer + 1))
@@ -799,6 +821,7 @@ def validate_outputs(canonical_joint_fname: str | Path,
         expected_zero_based,
         expected_rows,
         expected_final_layer,
+        expected_anchor_tolerance,
     )
 
     artifacts = {
@@ -856,6 +879,11 @@ def parse_args() -> argparse.Namespace:
         "--expected-final-layer", type=int, default=EXPECTED_FINAL_LAYER
     )
     parser.add_argument("--expected-model", default=EXPECTED_MODEL)
+    parser.add_argument(
+        "--expected-anchor-tolerance",
+        type=float,
+        default=EXPECTED_ANCHOR_TOLERANCE,
+    )
     return parser.parse_args()
 
 
@@ -877,6 +905,7 @@ def main() -> None:
         expected_seed=args.expected_seed,
         expected_final_layer=args.expected_final_layer,
         expected_model=args.expected_model,
+        expected_anchor_tolerance=args.expected_anchor_tolerance,
     )
     print(json.dumps(completion, indent=2, sort_keys=True))
 
