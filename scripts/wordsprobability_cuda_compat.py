@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Run wordsprobability 0.17 safely when model outputs live on CUDA.
 
-The package concatenates NumPy arrays with Torch tensors. CPU tensors are
-implicitly converted by NumPy, but CUDA tensors raise before the package can
-finish a passage. Convert Torch inputs explicitly at that narrow boundary
-while leaving model loading and inference on the selected device.
+The package leaves its vocabulary masks on CPU and concatenates NumPy arrays
+with Torch tensors. Both assumptions fail when the model runs on CUDA. Move
+the masks to the model device and convert Torch inputs explicitly at the
+NumPy boundary while leaving model loading and inference on the selected
+device.
 """
 
 from __future__ import annotations
@@ -34,15 +35,32 @@ def cuda_safe_concatenate(
     )
 
 
+def _move_vocab_masks_to_model_device(model: Any) -> None:
+    model.vocab_masks = {
+        name: value.to(model.device) if torch.is_tensor(value) else value
+        for name, value in model.vocab_masks.items()
+    }
+
+
 def main() -> int:
+    from wordsprobability.models.bow_lm import BaseBOWModel
+
     original = np.concatenate
+    original_mask_initializer = BaseBOWModel._initialise_vocab_masks
+
+    def initialise_device_safe_vocab_masks(model: Any) -> None:
+        original_mask_initializer(model)
+        _move_vocab_masks_to_model_device(model)
+
     np.concatenate = cuda_safe_concatenate
+    BaseBOWModel._initialise_vocab_masks = initialise_device_safe_vocab_masks
     try:
         from wordsprobability.main import main as wordsprobability_main
 
         result = wordsprobability_main()
         return 0 if result is None else int(result)
     finally:
+        BaseBOWModel._initialise_vocab_masks = original_mask_initializer
         np.concatenate = original
 
 

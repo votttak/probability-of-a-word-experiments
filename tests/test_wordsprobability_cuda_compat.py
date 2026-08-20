@@ -3,7 +3,10 @@ import unittest
 import numpy as np
 import torch
 
-from scripts.wordsprobability_cuda_compat import cuda_safe_concatenate
+from scripts.wordsprobability_cuda_compat import (
+    _move_vocab_masks_to_model_device,
+    cuda_safe_concatenate,
+)
 
 
 class WordsprobabilityCudaCompatTests(unittest.TestCase):
@@ -20,6 +23,20 @@ class WordsprobabilityCudaCompatTests(unittest.TestCase):
         observed = cuda_safe_concatenate([tensor, np.asarray([3.0])])
 
         np.testing.assert_array_equal(observed, np.asarray([1.0, 2.0, 3.0]))
+
+    def test_moves_all_tensor_vocab_masks_to_model_device(self):
+        class FakeModel:
+            device = torch.device("cpu")
+            vocab_masks = {
+                "bow": torch.tensor([1.0]),
+                "metadata": "unchanged",
+            }
+
+        model = FakeModel()
+        _move_vocab_masks_to_model_device(model)
+
+        self.assertEqual(model.vocab_masks["bow"].device, model.device)
+        self.assertEqual(model.vocab_masks["metadata"], "unchanged")
 
 
 if __name__ == "__main__":
