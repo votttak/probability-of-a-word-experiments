@@ -1,0 +1,26 @@
+{
+  "canonical_joint_sha256": "a66f7ae10a5f1b342a2d55c7acc1360d9ba119c37db2d29a4be1573f1b84ad84",
+  "canonical_text_sha256": "04578a7187ec7edb779362f912df97befc74f7945c4d554902e2049041579da4",
+  "natural_stories": {
+    "aligned_conllx_sha256": "21e8bfa0fec0484f7fb66aa8220ef1817225cbfebe9ac11334ce916db1d12f41",
+    "processed_rt_sha256": "208ee6c451f3827734d5b2de32b91e2cf3bd76aa177c412cb426373fa7d50b22",
+    "repository": "https://github.com/languageMIT/naturalstories.git",
+    "revision": "4700daad696e942f5aba23c957a7423d0de66612"
+  },
+  "portable_frequency": {
+    "epsilon": 1e-07,
+    "peeked_compatibility_key": [
+      2,
+      748
+    ],
+    "rows": 10256,
+    "sha256": "208f9749acec1894e9e6b46f56ca889621fdbc8e4a5bb9e879743920f448c47a",
+    "wordfreq_version": "3.1.1"
+  },
+  "portable_paper_rt": {
+    "rows": 10256,
+    "sha256": "cef406dfb4eaef3fdd12b4f94f7f20418fc394dcceb42981a7171370cfc6c145"
+  },
+  "schema_version": 1,
+  "sentence_manifest_sha256": "f9e14f6ac9d1d7624dba51c9d658721a11c1a596560ade6f33fba6767e4f8263"
+}

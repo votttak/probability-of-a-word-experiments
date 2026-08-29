@@ -121,8 +121,16 @@ class InternalLayerMappingTest(unittest.TestCase):
     def test_default_layers_are_block_outputs_only(self):
         model = SimpleNamespace(config=SimpleNamespace(n_layer=12))
         self.assertEqual(validate_layers(model, None), list(range(1, 13)))
+        self.assertEqual(
+            validate_layers(model, None, include_embedding_layer=True),
+            list(range(0, 13)),
+        )
+        self.assertEqual(
+            validate_layers(model, [0, 1, 12], include_embedding_layer=True),
+            [0, 1, 12],
+        )
         self.assertEqual(validate_layers(model, [12, 1, 6, 6]), [1, 6, 12])
-        with self.assertRaisesRegex(ValueError, "embedding stream"):
+        with self.assertRaisesRegex(ValueError, "include-embedding-layer"):
             validate_layers(model, [0],)
         with self.assertRaisesRegex(ValueError, "between 1 and 12"):
             validate_layers(model, [13])

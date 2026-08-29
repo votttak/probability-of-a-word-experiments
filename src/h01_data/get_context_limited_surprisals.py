@@ -191,20 +191,52 @@ def corrected_word_surprisal(raw_surprisal, start_boundary_surprisal,
     return raw_surprisal - start_boundary_surprisal + end_boundary_surprisal
 
 
-def load_wordsprobability_model(model_name):
+def load_wordsprobability_model(model_name, revision=None):
     """CONTEXT-LIMITED: Load one compatible model wrapper for the whole run."""
 
     # CONTEXT-LIMITED: Import lazily so pure unit tests never initialize or
     # download Transformer weights.
     try:
-        from wordsprobability.models import get_model
+        from wordsprobability.models import MODELS, get_model
     except ImportError as error:
         raise RuntimeError(
             "wordsprobability is required; install the same package used by "
             "the main surprisal pipeline"
         ) from error
 
-    wrapper = get_model(model_name)
+    if revision is None:
+        wrapper = get_model(model_name)
+    else:
+        if not isinstance(revision, str) or not revision.strip():
+            raise ValueError("model revision must be a nonempty string")
+        try:
+            wrapper_class = MODELS[model_name]
+        except KeyError as error:
+            raise ValueError(
+                f"wordsprobability has no wrapper for model {model_name!r}"
+            ) from error
+        # Construct the same wrapper deterministically, but forward a pinned
+        # Hugging Face revision. The package's public constructor has no
+        # revision parameter, which would otherwise make a tuned-lens run use
+        # whichever base snapshot happens to be current in the local cache.
+        wrapper = wrapper_class.__new__(wrapper_class)
+        wrapper.model = wrapper_class.model_cls.from_pretrained(
+            wrapper_class.model_name, revision=revision
+        )
+        wrapper.model.eval()
+        try:
+            import torch
+        except ImportError as error:
+            raise RuntimeError("PyTorch is required to load the model") from error
+        if torch.cuda.is_available():
+            wrapper.model = wrapper.model.cuda()
+        wrapper.tokenizer = wrapper_class.tokenizer_cls.from_pretrained(
+            wrapper_class.model_name, revision=revision
+        )
+        wrapper.device = wrapper.model.device
+        wrapper.bos_token_id = wrapper.tokenizer.bos_token_id
+        wrapper.eos_token_id = wrapper.tokenizer.eos_token_id
+        wrapper._initialise_vocab_masks()
     required_attributes = ("model", "tokenizer", "vocab_masks")
     missing = [name for name in required_attributes if not hasattr(wrapper, name)]
     if missing:

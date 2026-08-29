@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
-"""Compute boundary-corrected full-context surprisal with a logit lens.
+"""Compute internal-layer word surprisal with configurable context and lens.
 
-The scorer deliberately mirrors wordsprobability 0.17: one passage per line,
-BOS/EOS framing, 1,022-token overlapping chunks with stride 200, and its
-weighted word-boundary correction. Hidden-state indices 1..N are transformer
-block outputs; index 0 (the uncontextualized embedding stream) is excluded.
+The legacy defaults deliberately mirror wordsprobability 0.17: one passage per
+line, BOS/EOS framing, 1,022-token overlapping chunks with stride 200, and its
+weighted word-boundary correction. The factorial experiment additionally
+supports sentence-reset context, raw (``surprisal_buggy``) subtoken aggregation,
+and a tuned lens. Hidden-state indices 1..N are transformer block outputs.
+The legacy default excludes hidden state 0; --include-embedding-layer enables
+Kuribayashi et al.'s exact 0..N enumeration.
 """
 
 import argparse
@@ -21,24 +24,38 @@ import sys
 import tempfile
 
 try:
+    from .build_natural_stories_sentence_manifest import read_sentence_manifest
     from .get_context_limited_surprisals import (
         load_wordsprobability_model,
         read_texts,
     )
     from .internal_layer_models import get_model_spec, model_aliases
+    from .tuned_lens_decoder import (
+        inspect_local_tuned_lens_artifact,
+        load_local_tuned_lens_decoder,
+    )
 except ImportError:  # Support direct execution from src/h01_data.
+    from build_natural_stories_sentence_manifest import read_sentence_manifest
     from get_context_limited_surprisals import (
         load_wordsprobability_model,
         read_texts,
     )
     from internal_layer_models import get_model_spec, model_aliases
+    from tuned_lens_decoder import (
+        inspect_local_tuned_lens_artifact,
+        load_local_tuned_lens_decoder,
+    )
 
 
 PREDICTOR_PREFIX = "internal_layer_surprisal_layer_"
+BUGGY_PREDICTOR_PREFIX = "internal_layer_surprisal_buggy_layer_"
 MAX_ENCODED_TOKENS = 1022
 CHUNK_STRIDE = 200
 NEGATIVE_ROUNDOFF_TOLERANCE = 1e-5
-PASSAGE_CHECKPOINT_SCHEMA_VERSION = 1
+PASSAGE_CHECKPOINT_SCHEMA_VERSION = 2
+CONTEXT_UNITS = ("passage", "sentence")
+FIRST_WORD_POLICIES = ("bos", "bow")
+LENS_METHODS = ("logit-lens", "tuned-lens")
 
 
 @dataclass(frozen=True)
@@ -59,11 +76,59 @@ def parse_args():
     parser.add_argument("--output-fname", required=True)
     parser.add_argument("--model", required=True, choices=model_aliases())
     parser.add_argument(
+        "--model-revision",
+        help=(
+            "pinned Hugging Face base-model revision; a tuned-lens artifact "
+            "revision is used automatically and must agree when both are set"
+        ),
+    )
+    parser.add_argument(
+        "--context-unit",
+        choices=CONTEXT_UNITS,
+        default="passage",
+        help="reset model context at passages (legacy) or authoritative sentences",
+    )
+    parser.add_argument(
+        "--sentence-map-fname",
+        help="validated sentence manifest; required with --context-unit sentence",
+    )
+    parser.add_argument(
+        "--sentence-first-token-policy",
+        choices=FIRST_WORD_POLICIES,
+        default="bos",
+        help=(
+            "tokenize a sentence-initial word without a leading space (bos) or "
+            "with Kuribayashi's leading-space/BOW framing (bow)"
+        ),
+    )
+    parser.add_argument(
+        "--return-buggy-surprisals",
+        action="store_true",
+        help="also emit raw subtoken-NLL sums for every layer",
+    )
+    parser.add_argument(
+        "--lens-method",
+        choices=LENS_METHODS,
+        default="logit-lens",
+    )
+    parser.add_argument(
+        "--tuned-lens-path",
+        help="explicit local tuned-lens artifact directory; required for tuned-lens",
+    )
+    parser.add_argument(
         "--layers",
         type=int,
         nargs="+",
         default=None,
         help="transformer block indices to emit; omit for every block",
+    )
+    parser.add_argument(
+        "--include-embedding-layer",
+        action="store_true",
+        help=(
+            "allow and, when --layers is omitted, emit hidden state 0 to "
+            "match Kuribayashi et al.'s exact layer enumeration"
+        ),
     )
     parser.add_argument(
         "--passage-checkpoint-dir",
@@ -78,6 +143,31 @@ def parse_args():
     )
     parser.add_argument("--anchor-tolerance", type=float, default=5e-4)
     return parser.parse_args()
+
+
+def validate_factorial_options(context_unit, sentence_map_fname,
+                               first_word_policy, lens_method,
+                               tuned_lens_path):
+    """Reject ambiguous factor combinations before loading a model."""
+
+    if context_unit == "sentence" and not sentence_map_fname:
+        raise ValueError(
+            "--sentence-map-fname is required with --context-unit sentence"
+        )
+    if context_unit == "passage" and sentence_map_fname:
+        raise ValueError(
+            "--sentence-map-fname is only valid with --context-unit sentence"
+        )
+    if context_unit == "passage" and first_word_policy != "bos":
+        raise ValueError(
+            "--sentence-first-token-policy bow requires sentence context"
+        )
+    if lens_method == "tuned-lens" and not tuned_lens_path:
+        raise ValueError("--tuned-lens-path is required for tuned-lens")
+    if lens_method == "logit-lens" and tuned_lens_path:
+        raise ValueError(
+            "--tuned-lens-path cannot be supplied with logit-lens"
+        )
 
 
 def model_layer_count(model):
@@ -104,17 +194,22 @@ def validate_registered_model_layer_count(model_name, model):
     return observed
 
 
-def validate_layers(model, layers):
-    """Normalize requested block-output indices."""
+def validate_layers(model, layers, include_embedding_layer=False):
+    """Normalize requested hidden-state indices."""
 
     final_layer = model_layer_count(model)
+    minimum_layer = 0 if include_embedding_layer else 1
     if layers is None:
-        return list(range(1, final_layer + 1))
+        return list(range(minimum_layer, final_layer + 1))
     layers = sorted(set(layers))
-    if not layers or layers[0] < 1 or layers[-1] > final_layer:
+    if not layers or layers[0] < minimum_layer or layers[-1] > final_layer:
+        lower_bound = (
+            "0 (embedding) with --include-embedding-layer"
+            if include_embedding_layer else "1"
+        )
         raise ValueError(
-            f"layers must be between 1 and {final_layer}, inclusive; "
-            "hidden state 0 is the embedding stream"
+            f"layers must be between {lower_bound} and {final_layer}, inclusive; "
+            "hidden state 0 is available only with --include-embedding-layer"
         )
     return layers
 
@@ -183,7 +278,12 @@ def normalized_texts_sha256(texts):
 
 
 def passage_checkpoint_identity(model_name, wrapper, layers, torch,
-                                texts=None):
+                                texts=None, context_unit="passage",
+                                segmentation_sha256=None,
+                                first_word_policy="bos",
+                                return_buggy_surprisals=False,
+                                lens_method="logit-lens",
+                                lens_identity=None):
     """Describe every setting that can change a resumable passage score."""
 
     model = wrapper.model
@@ -211,6 +311,15 @@ def passage_checkpoint_identity(model_name, wrapper, layers, torch,
             normalized_texts_sha256(texts) if texts is not None else None
         ),
         "layers": list(layers),
+        "context_unit": context_unit,
+        "segmentation_sha256": segmentation_sha256,
+        "first_word_policy": first_word_policy,
+        "score_kinds": (
+            ["corrected", "buggy"]
+            if return_buggy_surprisals else ["corrected"]
+        ),
+        "lens_method": lens_method,
+        "lens_identity": lens_identity,
         "max_encoded_tokens": MAX_ENCODED_TOKENS,
         "chunk_stride": CHUNK_STRIDE,
         "negative_roundoff_tolerance": NEGATIVE_ROUNDOFF_TOLERANCE,
@@ -372,19 +481,32 @@ def weighted_boundary_surprisal(logits, weights, torch,
 
 
 def layer_logits(layer_id, final_layer, hidden_states, ordinary_logits,
-                 final_norm, output_head, position_offset=0):
-    """Decode one block output according to the logit-lens definition."""
+                 final_norm, output_head, position_offset=0,
+                 lens_method="logit-lens", tuned_lens=None):
+    """Decode one block output with the selected lens."""
 
     if layer_id == final_layer:
         # The final hidden state is already normalized; use ordinary logits to
         # prevent an accidental second application of the final norm.
         return ordinary_logits[:, position_offset:, :]
+    if lens_method == "tuned-lens":
+        if tuned_lens is None:
+            raise ValueError("tuned-lens decoding requires a loaded lens")
+        return tuned_lens.layer_logits(
+            layer_id,
+            hidden_states,
+            ordinary_logits,
+            position_offset=position_offset,
+        )
+    if lens_method != "logit-lens":
+        raise ValueError(f"Unsupported lens method: {lens_method}")
     return output_head(
         final_norm(hidden_states[layer_id][:, position_offset:, :])
     )
 
 
-def token_word_ids(token_ids, tokenizer, bow_symbol, expected_words):
+def token_word_ids(token_ids, tokenizer, bow_symbol, expected_words,
+                   first_word_policy="bos"):
     """Map retained GPT-style tokens to whitespace-word IDs as the package does."""
 
     tokens = tokenizer.convert_ids_to_tokens(token_ids)
@@ -394,8 +516,14 @@ def token_word_ids(token_ids, tokenizer, bow_symbol, expected_words):
         isinstance(token, str) and token.startswith(bow_symbol)
         for token in tokens
     ]
-    if not is_bow or is_bow[0]:
-        raise ValueError("The passage's first subtoken is not a BOS-class token")
+    if not is_bow:
+        raise ValueError("The score unit has no retained subtokens")
+    if first_word_policy == "bos" and is_bow[0]:
+        raise ValueError("The first subtoken is not a BOS-class token")
+    if first_word_policy == "bow" and not is_bow[0]:
+        raise ValueError("The first subtoken is not a leading-space/BOW token")
+    if first_word_policy not in FIRST_WORD_POLICIES:
+        raise ValueError(f"Unsupported first-word policy: {first_word_policy}")
 
     word_ids = []
     word_id = 0
@@ -425,7 +553,11 @@ def aggregate_layer_scores(raw, bow_fix, bos_fix, final_bow_fix, word_ids,
         corrected = raw[token_index]
         if is_bow[token_index]:
             corrected -= bow_fix[token_index]
-        if token_index == 0:
+        # A score unit begins in exactly one known start class. Ordinary
+        # wordsprobability framing has a non-BOW first token and conditions on
+        # BOS. Kuribayashi's leading-space framing has a BOW first token and
+        # conditions on BOW. Never subtract both corrections.
+        if token_index == 0 and not is_bow[token_index]:
             corrected -= bos_fix[token_index]
         if is_eow[token_index]:
             corrected += eow_fix[token_index]
@@ -445,17 +577,47 @@ def aggregate_layer_scores(raw, bow_fix, bos_fix, final_bow_fix, word_ids,
     return word_scores
 
 
+def aggregate_buggy_layer_scores(raw, word_ids, word_count):
+    """Sum uncorrected subtoken NLLs into project words."""
+
+    if len(raw) != len(word_ids):
+        raise RuntimeError("Raw metric length does not match retained tokens")
+    word_scores = [0.0] * word_count
+    for token_index, word_id in enumerate(word_ids):
+        value = raw[token_index]
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"Invalid raw surprisal {value} at subtoken {token_index}"
+            )
+        word_scores[word_id] += value
+    if any(not math.isfinite(value) or value < 0 for value in word_scores):
+        raise ValueError("Invalid aggregated buggy surprisal")
+    return word_scores
+
+
 def score_passage(words, text_id, wrapper, layers, torch, device,
-                  final_norm, output_head, boundary_masks):
-    """Score one passage at all selected transformer blocks."""
+                  final_norm, output_head, boundary_masks,
+                  return_buggy_surprisals=False,
+                  first_word_policy="bos", lens_method="logit-lens",
+                  tuned_lens=None, allow_multiple_chunks=True):
+    """Score one independently framed word sequence at selected blocks."""
 
     passage = " ".join(words)
+    if first_word_policy == "bow":
+        passage = " " + passage
+    elif first_word_policy != "bos":
+        raise ValueError(f"Unsupported first-word policy: {first_word_policy}")
     chunks = build_passage_chunks(
         passage,
         wrapper.tokenizer,
         wrapper.tokenizer.bos_token_id,
         wrapper.tokenizer.eos_token_id,
     )
+    if not allow_multiple_chunks and len(chunks) != 1:
+        raise ValueError(
+            "Sentence exceeds the model's single-window limit; refusing an "
+            "unreported within-sentence context reset"
+        )
     retained_token_ids = []
     metrics = {
         layer_id: {"raw": [], "bow": [], "bos": [], "final_bow": None}
@@ -495,6 +657,8 @@ def score_passage(words, text_id, wrapper, layers, torch, device,
                 final_norm,
                 output_head,
                 position_offset=position_offset,
+                lens_method=lens_method,
+                tuned_lens=tuned_lens,
             )
             shifted = logits[0, :-1, :]
             retained_labels = labels[position_offset:]
@@ -543,8 +707,10 @@ def score_passage(words, text_id, wrapper, layers, torch, device,
         wrapper.tokenizer,
         wrapper.bow_symbol,
         len(words),
+        first_word_policy=first_word_policy,
     )
     scores = {}
+    buggy_scores = {}
     for layer_id in layers:
         layer_metrics = metrics[layer_id]
         word_scores = aggregate_layer_scores(
@@ -559,10 +725,29 @@ def score_passage(words, text_id, wrapper, layers, torch, device,
         )
         for word_id, value in enumerate(word_scores):
             scores[(text_id, word_id, layer_id)] = value
+        if return_buggy_surprisals:
+            buggy_word_scores = aggregate_buggy_layer_scores(
+                layer_metrics["raw"], word_ids, len(words)
+            )
+            for word_id, value in enumerate(buggy_word_scores):
+                buggy_scores[(text_id, word_id, layer_id)] = value
+    if return_buggy_surprisals:
+        return scores, buggy_scores
     return scores
 
 
-def passage_rows(words, text_id, layers, scores):
+def layer_output_fields(layers, return_buggy_surprisals=False):
+    """Return the deterministic predictor field order for one artifact."""
+
+    fields = [f"{PREDICTOR_PREFIX}{layer_id}" for layer_id in layers]
+    if return_buggy_surprisals:
+        fields.extend(
+            f"{BUGGY_PREDICTOR_PREFIX}{layer_id}" for layer_id in layers
+        )
+    return fields
+
+
+def passage_rows(words, text_id, layers, scores, buggy_scores=None):
     """Convert one passage's keyed scores into stable TSV rows."""
 
     rows = []
@@ -573,16 +758,23 @@ def passage_rows(words, text_id, layers, scores):
             if key not in scores:
                 raise ValueError(f"Missing internal-layer score key: {key}")
             row[f"{PREDICTOR_PREFIX}{layer_id}"] = scores[key]
+            if buggy_scores is not None:
+                if key not in buggy_scores:
+                    raise ValueError(
+                        f"Missing buggy internal-layer score key: {key}"
+                    )
+                row[f"{BUGGY_PREDICTOR_PREFIX}{layer_id}"] = buggy_scores[key]
         rows.append(row)
     return rows
 
 
-def read_passage_checkpoint(fname, words, text_id, layers):
+def read_passage_checkpoint(fname, words, text_id, layers,
+                            return_buggy_surprisals=False):
     """Validate and load one completed passage checkpoint."""
 
-    expected_fields = ["text_id", "word_id", "word"] + [
-        f"{PREDICTOR_PREFIX}{layer_id}" for layer_id in layers
-    ]
+    expected_fields = ["text_id", "word_id", "word"] + layer_output_fields(
+        layers, return_buggy_surprisals=return_buggy_surprisals
+    )
     with open(fname, "r", encoding="utf8", newline="") as input_file:
         reader = csv.DictReader(input_file, delimiter="\t")
         if reader.fieldnames != expected_fields:
@@ -597,6 +789,7 @@ def read_passage_checkpoint(fname, words, text_id, layers):
         )
 
     scores = {}
+    buggy_scores = {}
     for word_id, (row, word) in enumerate(zip(rows, words)):
         try:
             observed_text_id = int(row["text_id"])
@@ -627,11 +820,101 @@ def read_passage_checkpoint(fname, words, text_id, layers):
                     f"Passage checkpoint has non-finite/negative value: {fname}"
                 )
             scores[(text_id, word_id, layer_id)] = value
+            if return_buggy_surprisals:
+                buggy_column = f"{BUGGY_PREDICTOR_PREFIX}{layer_id}"
+                try:
+                    buggy_value = float(row[buggy_column])
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"Passage checkpoint has invalid value in "
+                        f"{buggy_column}: {fname}"
+                    ) from error
+                if not math.isfinite(buggy_value) or buggy_value < 0:
+                    raise ValueError(
+                        "Passage checkpoint has non-finite/negative buggy "
+                        f"value: {fname}"
+                    )
+                buggy_scores[(text_id, word_id, layer_id)] = buggy_value
+    if return_buggy_surprisals:
+        return scores, buggy_scores
+    return scores
+
+
+def score_sentence_bounded_text(words, text_id, sentence_units, wrapper,
+                                layers, torch, device, final_norm,
+                                output_head, boundary_masks,
+                                return_buggy_surprisals=False,
+                                first_word_policy="bos",
+                                lens_method="logit-lens",
+                                tuned_lens=None):
+    """Score one story as independently BOS-framed authoritative sentences."""
+
+    scores = {}
+    buggy_scores = {}
+    observed_word_ids = []
+    for sentence in sentence_units:
+        sentence_words = list(sentence.words)
+        sentence_word_ids = list(sentence.word_ids)
+        if len(sentence_words) != len(sentence_word_ids) or not sentence_words:
+            raise ValueError(
+                f"Invalid sentence {sentence.sentence_id} in text {text_id}"
+            )
+        expected_words = [words[word_id] for word_id in sentence_word_ids]
+        if sentence_words != expected_words:
+            raise ValueError(
+                f"Sentence-map word mismatch in text {text_id}, "
+                f"sentence {sentence.sentence_id}"
+            )
+        loaded_scores = score_passage(
+            sentence_words,
+            text_id,
+            wrapper,
+            layers,
+            torch,
+            device,
+            final_norm,
+            output_head,
+            boundary_masks,
+            return_buggy_surprisals=return_buggy_surprisals,
+            first_word_policy=first_word_policy,
+            lens_method=lens_method,
+            tuned_lens=tuned_lens,
+            allow_multiple_chunks=False,
+        )
+        if return_buggy_surprisals:
+            local_scores, local_buggy_scores = loaded_scores
+        else:
+            local_scores = loaded_scores
+            local_buggy_scores = None
+        for local_word_id, global_word_id in enumerate(sentence_word_ids):
+            observed_word_ids.append(global_word_id)
+            for layer_id in layers:
+                local_key = (text_id, local_word_id, layer_id)
+                global_key = (text_id, global_word_id, layer_id)
+                if global_key in scores:
+                    raise ValueError(
+                        f"Duplicate sentence-map word ID: {global_key}"
+                    )
+                scores[global_key] = local_scores[local_key]
+                if local_buggy_scores is not None:
+                    buggy_scores[global_key] = local_buggy_scores[local_key]
+
+    if observed_word_ids != list(range(len(words))):
+        raise ValueError(
+            f"Sentence map does not cover text {text_id} contiguously"
+        )
+    if return_buggy_surprisals:
+        return scores, buggy_scores
     return scores
 
 
 def score_passages(texts, wrapper, layers, passage_checkpoint_dir=None,
-                   model_name="unspecified"):
+                   model_name="unspecified",
+                   return_buggy_surprisals=False,
+                   first_word_policy="bos", lens_method="logit-lens",
+                   tuned_lens=None, lens_identity=None,
+                   context_unit="passage", sentence_map=None,
+                   segmentation_sha256=None):
     """Score every nonempty passage and return stable keyed values."""
 
     try:
@@ -651,13 +934,24 @@ def score_passages(texts, wrapper, layers, passage_checkpoint_dir=None,
         vocabulary_size = len(wrapper.tokenizer)
     boundary_masks = weighted_boundary_masks(wrapper, device, vocabulary_size)
     identity = passage_checkpoint_identity(
-        model_name, wrapper, layers, torch, texts=texts
+        model_name,
+        wrapper,
+        layers,
+        torch,
+        texts=texts,
+        context_unit=context_unit,
+        segmentation_sha256=segmentation_sha256,
+        first_word_policy=first_word_policy,
+        return_buggy_surprisals=return_buggy_surprisals,
+        lens_method=lens_method,
+        lens_identity=lens_identity,
     )
     checkpoint_run_dir = prepare_passage_checkpoint_dir(
         passage_checkpoint_dir, identity
     )
 
     scores = {}
+    buggy_scores = {}
     with torch.inference_mode():
         for text_id, words in enumerate(texts):
             if not words:
@@ -667,59 +961,138 @@ def score_passages(texts, wrapper, layers, passage_checkpoint_dir=None,
                 if checkpoint_run_dir is not None else None
             )
             if checkpoint_fname is not None and checkpoint_fname.exists():
-                passage_scores = read_passage_checkpoint(
-                    checkpoint_fname, words, text_id, layers
+                loaded_scores = read_passage_checkpoint(
+                    checkpoint_fname,
+                    words,
+                    text_id,
+                    layers,
+                    return_buggy_surprisals=return_buggy_surprisals,
                 )
                 action = "reused"
             else:
-                passage_scores = score_passage(
-                    words,
-                    text_id,
-                    wrapper,
-                    layers,
-                    torch,
-                    device,
-                    final_norm,
-                    output_head,
-                    boundary_masks,
-                )
-                if checkpoint_fname is not None:
-                    write_rows_atomic(
-                        passage_rows(
-                            words, text_id, layers, passage_scores
-                        ),
-                        checkpoint_fname,
+                if context_unit == "passage":
+                    loaded_scores = score_passage(
+                        words,
+                        text_id,
+                        wrapper,
                         layers,
+                        torch,
+                        device,
+                        final_norm,
+                        output_head,
+                        boundary_masks,
+                        return_buggy_surprisals=return_buggy_surprisals,
+                        first_word_policy=first_word_policy,
+                        lens_method=lens_method,
+                        tuned_lens=tuned_lens,
                     )
+                elif context_unit == "sentence":
+                    if sentence_map is None:
+                        raise ValueError(
+                            "sentence context requires a validated sentence map"
+                        )
+                    loaded_scores = score_sentence_bounded_text(
+                        words,
+                        text_id,
+                        sentence_map[text_id],
+                        wrapper,
+                        layers,
+                        torch,
+                        device,
+                        final_norm,
+                        output_head,
+                        boundary_masks,
+                        return_buggy_surprisals=return_buggy_surprisals,
+                        first_word_policy=first_word_policy,
+                        lens_method=lens_method,
+                        tuned_lens=tuned_lens,
+                    )
+                else:
+                    raise ValueError(f"Unsupported context unit: {context_unit}")
                 action = "scored"
+            if return_buggy_surprisals:
+                passage_scores, passage_buggy_scores = loaded_scores
+            else:
+                passage_scores = loaded_scores
+                passage_buggy_scores = None
+            if checkpoint_fname is not None and not checkpoint_fname.exists():
+                write_rows_atomic(
+                    passage_rows(
+                        words,
+                        text_id,
+                        layers,
+                        passage_scores,
+                        buggy_scores=passage_buggy_scores,
+                    ),
+                    checkpoint_fname,
+                    layers,
+                    return_buggy_surprisals=return_buggy_surprisals,
+                )
             overlap = set(scores).intersection(passage_scores)
             if overlap:
                 raise ValueError(
                     f"Duplicate internal-layer score key: {next(iter(overlap))}"
                 )
             scores.update(passage_scores)
+            if passage_buggy_scores is not None:
+                buggy_overlap = set(buggy_scores).intersection(
+                    passage_buggy_scores
+                )
+                if buggy_overlap:
+                    raise ValueError(
+                        "Duplicate buggy internal-layer score key: "
+                        f"{next(iter(buggy_overlap))}"
+                    )
+                buggy_scores.update(passage_buggy_scores)
             print(
                 f"INTERNAL-LAYER {action} text={text_id} words={len(words)}",
                 file=sys.stderr,
                 flush=True,
             )
+    if return_buggy_surprisals:
+        return scores, buggy_scores
     return scores
 
 
 def build_rows(texts, wrapper, layers, passage_checkpoint_dir=None,
-               model_name="unspecified"):
+               model_name="unspecified", return_buggy_surprisals=False,
+               first_word_policy="bos", lens_method="logit-lens",
+               tuned_lens=None, lens_identity=None,
+               context_unit="passage", sentence_map=None,
+               segmentation_sha256=None):
     """Create a merge-compatible table from internal-layer scores."""
 
-    scores = score_passages(
+    loaded_scores = score_passages(
         texts,
         wrapper,
         layers,
         passage_checkpoint_dir=passage_checkpoint_dir,
         model_name=model_name,
+        return_buggy_surprisals=return_buggy_surprisals,
+        first_word_policy=first_word_policy,
+        lens_method=lens_method,
+        tuned_lens=tuned_lens,
+        lens_identity=lens_identity,
+        context_unit=context_unit,
+        sentence_map=sentence_map,
+        segmentation_sha256=segmentation_sha256,
     )
+    if return_buggy_surprisals:
+        scores, buggy_scores = loaded_scores
+    else:
+        scores = loaded_scores
+        buggy_scores = None
     rows = []
     for text_id, words in enumerate(texts):
-        rows.extend(passage_rows(words, text_id, layers, scores))
+        rows.extend(
+            passage_rows(
+                words,
+                text_id,
+                layers,
+                scores,
+                buggy_scores=buggy_scores,
+            )
+        )
     return rows
 
 
@@ -732,7 +1105,8 @@ def _sha256_file(fname):
 
 
 def validate_final_layer_reference(rows, layers, model, reference_fname,
-                                   anchor_tolerance):
+                                   anchor_tolerance,
+                                   return_buggy_surprisals=False):
     """Validate the ordinary final layer against an established checkpoint."""
 
     if reference_fname is None:
@@ -752,6 +1126,8 @@ def validate_final_layer_reference(rows, layers, model, reference_fname,
     with open(reference_fname, "r", encoding="utf8", newline="") as input_file:
         reader = csv.DictReader(input_file, delimiter="\t")
         required = {"text_id", "word_id", "word", "surprisal"}
+        if return_buggy_surprisals:
+            required.add("surprisal_buggy")
         if not reader.fieldnames or not required.issubset(reader.fieldnames):
             raise ValueError(
                 "Reference surprisal table lacks required keyed columns"
@@ -764,6 +1140,7 @@ def validate_final_layer_reference(rows, layers, model, reference_fname,
         )
 
     differences = []
+    buggy_differences = []
     for index, (row, reference) in enumerate(zip(rows, reference_rows)):
         try:
             reference_key = (
@@ -788,6 +1165,23 @@ def validate_final_layer_reference(rows, layers, model, reference_fname,
                 f"Non-finite final-layer anchor difference at row {index}"
             )
         differences.append(difference)
+        if return_buggy_surprisals:
+            buggy_column = f"{BUGGY_PREDICTOR_PREFIX}{final_layer}"
+            try:
+                buggy_reference_value = float(reference["surprisal_buggy"])
+                buggy_layer_value = float(row[buggy_column])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Invalid buggy reference value at row {index}"
+                ) from error
+            buggy_difference = abs(
+                buggy_layer_value - buggy_reference_value
+            )
+            if not math.isfinite(buggy_difference):
+                raise ValueError(
+                    f"Non-finite buggy anchor difference at row {index}"
+                )
+            buggy_differences.append(buggy_difference)
 
     maximum = max(differences, default=0.0)
     mean = sum(differences) / len(differences) if differences else 0.0
@@ -801,6 +1195,17 @@ def validate_final_layer_reference(rows, layers, model, reference_fname,
             f"{final_column} differs from ordinary surprisal by "
             f"{maximum:.6g}, above tolerance {anchor_tolerance}"
         )
+    buggy_maximum = max(buggy_differences, default=0.0)
+    buggy_mean = (
+        sum(buggy_differences) / len(buggy_differences)
+        if buggy_differences else None
+    )
+    if return_buggy_surprisals and buggy_maximum > anchor_tolerance:
+        raise ValueError(
+            f"{BUGGY_PREDICTOR_PREFIX}{final_layer} differs from ordinary "
+            f"surprisal_buggy by {buggy_maximum:.6g}, above tolerance "
+            f"{anchor_tolerance}"
+        )
     report = {
         "validated": True,
         "reference_fname": str(Path(reference_fname).resolve()),
@@ -810,6 +1215,10 @@ def validate_final_layer_reference(rows, layers, model, reference_fname,
         "max_abs_difference": maximum,
         "mean_abs_difference": mean,
         "p99_abs_difference": p99,
+        "buggy_max_abs_difference": (
+            buggy_maximum if return_buggy_surprisals else None
+        ),
+        "buggy_mean_abs_difference": buggy_mean,
         "tolerance": anchor_tolerance,
     }
     print(
@@ -823,14 +1232,15 @@ def validate_final_layer_reference(rows, layers, model, reference_fname,
     return report
 
 
-def write_rows_atomic(rows, output_fname, layers):
+def write_rows_atomic(rows, output_fname, layers,
+                      return_buggy_surprisals=False):
     """Atomically publish only a complete layer-predictor TSV."""
 
     output_path = Path(output_fname)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["text_id", "word_id", "word"] + [
-        f"{PREDICTOR_PREFIX}{layer_id}" for layer_id in layers
-    ]
+    fieldnames = ["text_id", "word_id", "word"] + layer_output_fields(
+        layers, return_buggy_surprisals=return_buggy_surprisals
+    )
     descriptor, temporary_fname = tempfile.mkstemp(
         prefix=f".{output_path.name}.",
         suffix=".tmp",
@@ -853,13 +1263,62 @@ def write_rows_atomic(rows, output_fname, layers):
 
 def main():
     args = parse_args()
+    validate_factorial_options(
+        args.context_unit,
+        args.sentence_map_fname,
+        args.sentence_first_token_policy,
+        args.lens_method,
+        args.tuned_lens_path,
+    )
     texts = read_texts(args.input_fname)
-    wrapper = load_wordsprobability_model(args.model)
+    sentence_map = None
+    segmentation_sha256 = None
+    if args.context_unit == "sentence":
+        sentence_map, segmentation_sha256 = read_sentence_manifest(
+            Path(args.sentence_map_fname), texts
+        )
+    effective_model_revision = args.model_revision
+    tuned_artifact = None
+    if args.lens_method == "tuned-lens":
+        tuned_artifact = inspect_local_tuned_lens_artifact(
+            args.tuned_lens_path
+        )
+        artifact_revision = tuned_artifact.config.get("base_model_revision")
+        if (
+            effective_model_revision is not None
+            and artifact_revision is not None
+            and effective_model_revision != artifact_revision
+        ):
+            raise ValueError(
+                "--model-revision disagrees with the tuned-lens artifact: "
+                f"{effective_model_revision!r} versus {artifact_revision!r}"
+            )
+        if effective_model_revision is None:
+            effective_model_revision = artifact_revision
+    wrapper = load_wordsprobability_model(
+        args.model, revision=effective_model_revision
+    )
     validate_registered_model_layer_count(args.model, wrapper.model)
-    layers = validate_layers(wrapper.model, args.layers)
+    layers = validate_layers(
+        wrapper.model,
+        args.layers,
+        include_embedding_layer=args.include_embedding_layer,
+    )
+    tuned_lens = None
+    lens_identity = None
+    if args.lens_method == "tuned-lens":
+        tuned_lens = load_local_tuned_lens_decoder(
+            wrapper.model,
+            args.tuned_lens_path,
+            expected_base_model_name=get_model_spec(args.model).hf_name,
+        )
+        lens_identity = tuned_lens.provenance()
     log_internal_model_runtime(args.model, wrapper)
     print(
-        "INTERNAL-LAYER method=logit-lens "
+        f"INTERNAL-LAYER method={args.lens_method} "
+        f"context_unit={args.context_unit} "
+        f"first_word_policy={args.sentence_first_token_policy} "
+        f"score_kinds={'corrected,buggy' if args.return_buggy_surprisals else 'corrected'} "
         f"layers={','.join(str(layer) for layer in layers)} "
         f"chunk_tokens={MAX_ENCODED_TOKENS} stride={CHUNK_STRIDE}",
         file=sys.stderr,
@@ -871,6 +1330,14 @@ def main():
         layers,
         passage_checkpoint_dir=args.passage_checkpoint_dir,
         model_name=args.model,
+        return_buggy_surprisals=args.return_buggy_surprisals,
+        first_word_policy=args.sentence_first_token_policy,
+        lens_method=args.lens_method,
+        tuned_lens=tuned_lens,
+        lens_identity=lens_identity,
+        context_unit=args.context_unit,
+        sentence_map=sentence_map,
+        segmentation_sha256=segmentation_sha256,
     )
     anchor_report = validate_final_layer_reference(
         rows,
@@ -878,11 +1345,33 @@ def main():
         wrapper.model,
         args.reference_surprisal_fname,
         args.anchor_tolerance,
+        return_buggy_surprisals=args.return_buggy_surprisals,
     )
+    anchor_report["experiment"] = {
+        "model": args.model,
+        "model_revision_requested": args.model_revision,
+        "model_revision_effective": effective_model_revision,
+        "context_unit": args.context_unit,
+        "sentence_first_token_policy": args.sentence_first_token_policy,
+        "sentence_manifest_sha256": segmentation_sha256,
+        "lens_method": args.lens_method,
+        "lens_identity": lens_identity,
+        "score_kinds": (
+            ["corrected", "buggy"]
+            if args.return_buggy_surprisals else ["corrected"]
+        ),
+        "include_embedding_layer": args.include_embedding_layer,
+        "layers": layers,
+    }
     write_json_atomic(
         anchor_report, f"{args.output_fname}.anchor.json"
     )
-    write_rows_atomic(rows, args.output_fname, layers)
+    write_rows_atomic(
+        rows,
+        args.output_fname,
+        layers,
+        return_buggy_surprisals=args.return_buggy_surprisals,
+    )
 
 
 if __name__ == "__main__":
