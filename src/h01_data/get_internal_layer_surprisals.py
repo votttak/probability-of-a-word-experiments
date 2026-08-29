@@ -51,7 +51,11 @@ PREDICTOR_PREFIX = "internal_layer_surprisal_layer_"
 BUGGY_PREDICTOR_PREFIX = "internal_layer_surprisal_buggy_layer_"
 MAX_ENCODED_TOKENS = 1022
 CHUNK_STRIDE = 200
-NEGATIVE_ROUNDOFF_TOLERANCE = 1e-5
+# Boundary correction subtracts separately rounded float32 log-probabilities.
+# At early logit-lens layers their cancellation can leave a one-ULP negative
+# residue (observed as 2**-15 for Pythia); this is still far below the final
+# reference-anchor tolerance and is mathematically a zero surprisal.
+NEGATIVE_ROUNDOFF_TOLERANCE = 1e-4
 PASSAGE_CHECKPOINT_SCHEMA_VERSION = 2
 CONTEXT_UNITS = ("passage", "sentence")
 FIRST_WORD_POLICIES = ("bos", "bow")

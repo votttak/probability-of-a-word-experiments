@@ -86,7 +86,8 @@ class InternalLayerChunkTest(unittest.TestCase):
         scores = aggregate_layer_scores(
             raw=[0.0],
             bow_fix=[0.0],
-            bos_fix=[0.000002],
+            # Exact one-float32-ULP residue observed for Pythia-160M on CUDA.
+            bos_fix=[3.0517578125e-05],
             final_bow_fix=0.0,
             word_ids=[0],
             is_bow=[False],
