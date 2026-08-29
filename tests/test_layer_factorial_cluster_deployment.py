@@ -11,6 +11,7 @@ import tempfile
 import unittest
 
 from scripts import preflight_layer_factorial as preflight
+from scripts import stage_layer_factorial_resources as staging
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +63,60 @@ class LayerFactorialClusterDeploymentTest(unittest.TestCase):
         )
         self.assertIn("*spec.base_weight_files", text)
         self.assertIn("*spec.base_tokenizer_files", text)
+        self.assertNotIn("snapshot_download(", text)
+
+    def test_model_staging_downloads_only_exact_files_in_stable_order(self):
+        spec = SimpleNamespace(
+            alias="fixture",
+            hf_name="fixture/model",
+            base_model_revision="a" * 40,
+            base_tokenizer_files=("tokenizer.json", "config.json"),
+            base_weight_files=("weights.bin", "tokenizer.json"),
+        )
+        calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "snapshots" / spec.base_model_revision
+
+            def download(**kwargs):
+                calls.append(kwargs)
+                return snapshot / kwargs["filename"]
+
+            observed = staging.stage_model_snapshot(
+                spec, Path(directory) / "hub", False, download
+            )
+
+        self.assertEqual(observed, snapshot)
+        self.assertEqual(
+            [call["filename"] for call in calls],
+            ["config.json", "tokenizer.json", "weights.bin"],
+        )
+        self.assertTrue(all(not call["local_files_only"] for call in calls))
+
+    def test_model_verify_only_uses_offline_exact_file_lookups(self):
+        spec = SimpleNamespace(
+            alias="fixture",
+            hf_name="fixture/model",
+            base_model_revision="b" * 40,
+            base_tokenizer_files=("tokenizer.json",),
+            base_weight_files=("weights.bin",),
+        )
+        calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "snapshots" / spec.base_model_revision
+
+            def download(**kwargs):
+                calls.append(kwargs)
+                return snapshot / kwargs["filename"]
+
+            staging.stage_model_snapshot(
+                spec, Path(directory) / "hub", True, download
+            )
+
+        self.assertEqual(
+            [call["filename"] for call in calls],
+            ["config.json", "tokenizer.json", "weights.bin"],
+        )
+        self.assertTrue(all(call["local_files_only"] for call in calls))
 
     def test_preflight_validates_lens_identity(self):
         with tempfile.TemporaryDirectory() as directory:

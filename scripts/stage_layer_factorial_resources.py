@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import shutil
 import sys
 import tempfile
@@ -28,17 +29,6 @@ from h01_data.layer_factorial_models import (  # noqa: E402
     get_model_spec,
     model_aliases,
 )
-
-MODEL_METADATA_PATTERNS = (
-    "config.json",
-    "generation_config.json",
-    "merges.txt",
-    "vocab.json",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-)
-
 
 def sha256_file(path: str | Path) -> str:
     digest = hashlib.sha256()
@@ -136,12 +126,7 @@ def verify_model_snapshot(snapshot_path: Path, spec) -> None:
             f"cached {spec.alias} has {layer_count!r} layers; "
             f"expected {spec.final_layer}"
         )
-    required_files = (
-        "config.json",
-        *spec.base_tokenizer_files,
-        *spec.base_weight_files,
-    )
-    for filename in required_files:
+    for filename in required_model_files(spec):
         path = snapshot_path / filename
         if not path.is_file() or path.stat().st_size == 0:
             raise FileNotFoundError(
@@ -149,9 +134,61 @@ def verify_model_snapshot(snapshot_path: Path, spec) -> None:
             )
 
 
+def required_model_files(spec) -> tuple[str, ...]:
+    """Return the exact pinned model files once, in deterministic order."""
+
+    return tuple(dict.fromkeys((
+        "config.json",
+        *spec.base_tokenizer_files,
+        *spec.base_weight_files,
+    )))
+
+
+def snapshot_parent(downloaded_path: Path, filename: str) -> Path:
+    """Derive the snapshot directory from an exact Hub download path."""
+
+    parts = PurePosixPath(filename).parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"invalid Hugging Face model filename: {filename!r}")
+    parent = downloaded_path
+    for expected_part in reversed(parts):
+        if parent.name != expected_part:
+            raise ValueError(
+                f"downloaded path {downloaded_path} does not end with "
+                f"the requested filename {filename!r}"
+            )
+        parent = parent.parent
+    return parent
+
+
+def stage_model_snapshot(spec, hub_cache: Path, verify_only: bool, download) -> Path:
+    """Download or locate only the registry-pinned files for one model."""
+
+    snapshot_path = None
+    for filename in required_model_files(spec):
+        downloaded_path = Path(download(
+            repo_id=spec.hf_name,
+            filename=filename,
+            revision=spec.base_model_revision,
+            cache_dir=hub_cache,
+            local_files_only=verify_only,
+        ))
+        observed_snapshot = snapshot_parent(downloaded_path, filename)
+        if snapshot_path is None:
+            snapshot_path = observed_snapshot
+        elif observed_snapshot != snapshot_path:
+            raise ValueError(
+                f"cached {spec.alias} files span multiple snapshots: "
+                f"{snapshot_path} and {observed_snapshot}"
+            )
+    if snapshot_path is None:  # pragma: no cover - registry invariants forbid it
+        raise ValueError(f"no required model files registered for {spec.alias}")
+    return snapshot_path
+
+
 def stage_one(spec, lens_root: Path, hub_cache: Path, verify_only: bool) -> None:
     try:
-        from huggingface_hub import hf_hub_download, snapshot_download
+        from huggingface_hub import hf_hub_download
     except ImportError as error:
         raise RuntimeError(
             "huggingface_hub is required to stage layer-factorial resources"
@@ -188,17 +225,9 @@ def stage_one(spec, lens_root: Path, hub_cache: Path, verify_only: bool) -> None
         )
     verify_lens_config(lens_path / "config.json", spec)
 
-    snapshot_path = Path(snapshot_download(
-        repo_id=spec.hf_name,
-        revision=spec.base_model_revision,
-        cache_dir=hub_cache,
-        allow_patterns=(
-            *MODEL_METADATA_PATTERNS,
-            *spec.base_tokenizer_files,
-            *spec.base_weight_files,
-        ),
-        local_files_only=verify_only,
-    ))
+    snapshot_path = stage_model_snapshot(
+        spec, hub_cache, verify_only, hf_hub_download
+    )
     verify_model_snapshot(snapshot_path, spec)
     if not verify_only:
         write_json_atomic(
