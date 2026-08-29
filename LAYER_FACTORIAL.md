@@ -179,3 +179,52 @@ writes:
 Both `time` and `paper_time` are evaluated for all eight
 context/score/lens cells. The output validator must pass before any regression
 is fitted.
+
+## Cross-model analysis
+
+After all selected per-model combined reports exist, run the strict
+cross-model postprocessor:
+
+    python src/h03_paper/analyze_cross_model_layer_factorial.py \
+      --run-root "$RUN_ROOT" \
+      --output-dir "$RUN_ROOT/results/layer-factorial/cross_model_analysis"
+
+The same command works on a relocated compact archive when --run-root
+points to the extracted directory containing both results/layer-factorial
+and checkpoints/layer-factorial. By default it requires the full pinned
+nine-model registry. An explicit --models subset is available for testing
+or partial diagnostics.
+
+The postprocessor independently revalidates every full layer curve, recomputes
+each exact delta-LL argmax, reconciles the stored best-layer tables and
+summaries, checks registry depths and pinned revisions, verifies the archived
+extraction-validation hashes, and requires shared text, RT, frequency, and
+sentence-manifest hashes across models.
+
+It reports two layer scopes:
+
+- **including-embedding**, matching the extraction grid with layer 0 eligible;
+- **transformer-only**, which excludes layer 0, recomputes the argmax over
+  layers 1 through D, and retains the architectural depth definition
+  layer / D <= 0.2.
+
+## Full nine-model result
+
+The full paper-motivated cell (paper_time, sentence context, tuned lens,
+buggy surprisal) selects a layer in the first 20% for 9/9 models when layer 0
+is eligible and 8/9 models after re-optimizing over transformer layers only.
+The earlier project-style baseline (time, passage context, logit lens,
+corrected surprisal) reaches only 3/9 under either scope.
+
+Sentence-bounded context is the robust explanation for this difference. Over
+transformer layers, changing passage to sentence context moves the optimum
+earlier in 59/72 matched factorial cells, leaves 13 unchanged, and moves none
+later. Tuned-lens decoding has a smaller earlyward effect (42 earlier, 17
+unchanged, 13 later). Changing corrected to buggy surprisal leaves 60/72
+optima unchanged. Changing time to paper_time is sensitive to embedding
+eligibility and is not the dominant full-data factor.
+
+The local report generated from the compact cluster archive is at
+results/rt/layer_factorial/cross_model_analysis/REPORT.md. Machine-readable
+condition, model-response, paired-factor, integrity, and best-layer tables are
+written beside it.
