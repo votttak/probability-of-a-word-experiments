@@ -248,6 +248,63 @@ class WordsProbabilityLoaderTest(unittest.TestCase):
         self.assertEqual(wrapper.hf_model_revision, "immutable-revision")
         self.assertEqual(wrapper.vocab_masks, {"ready": True})
 
+    def test_override_normalizes_boundaries_before_mask_initialization(self):
+        class Tokenizer:
+            bos_token = None
+            eos_token = None
+
+            @property
+            def bos_token_id(self):
+                return 0 if self.bos_token == '<|endoftext|>' else None
+
+            @property
+            def eos_token_id(self):
+                return 0 if self.eos_token == '<|endoftext|>' else None
+
+            convert_tokens_to_ids = staticmethod(
+                lambda token: 0 if token == '<|endoftext|>' else None
+            )
+            convert_ids_to_tokens = staticmethod(
+                lambda token_id: '<|endoftext|>' if token_id == 0 else None
+            )
+
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                _name_or_path='EleutherAI/pythia-70m-deduped',
+                _commit_hash='immutable-revision',
+            ),
+            device=torch.device('cpu'),
+            eval=Mock(),
+        )
+
+        class FakeWrapper:
+            model_name = 'EleutherAI/pythia-70m'
+            model_cls = SimpleNamespace(from_pretrained=Mock(return_value=model))
+            tokenizer_cls = SimpleNamespace(
+                from_pretrained=Mock(return_value=Tokenizer())
+            )
+
+            def _initialise_vocab_masks(self):
+                self.mask_boundary_ids = (
+                    self.tokenizer.bos_token_id,
+                    self.tokenizer.eos_token_id,
+                )
+                self.vocab_masks = {'ready': True}
+
+        modules = self._fake_modules(Mock(), FakeWrapper)
+        with patch.dict(sys.modules, modules), patch.object(
+            torch.cuda, 'is_available', return_value=False
+        ):
+            wrapper = load_wordsprobability_model(
+                'pythia-70m',
+                revision='immutable-revision',
+                hf_model_name='EleutherAI/pythia-70m-deduped',
+            )
+
+        self.assertEqual(wrapper.mask_boundary_ids, (0, 0))
+        self.assertEqual(wrapper.bos_token_id, 0)
+        self.assertEqual(wrapper.eos_token_id, 0)
+
     def _load_override_with_actual_identity(self, name, revision):
         model = SimpleNamespace(
             config=SimpleNamespace(

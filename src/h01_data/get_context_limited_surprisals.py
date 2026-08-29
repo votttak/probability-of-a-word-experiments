@@ -191,6 +191,26 @@ def corrected_word_surprisal(raw_surprisal, start_boundary_surprisal,
     return raw_surprisal - start_boundary_surprisal + end_boundary_surprisal
 
 
+def normalize_pythia_boundary_tokens(model_name, tokenizer):
+    '''Repair missing BOS/EOS metadata in pinned Pythia tokenizers.'''
+
+    if not model_name.startswith('pythia-'):
+        return False
+    if tokenizer.bos_token_id is not None and tokenizer.eos_token_id is not None:
+        return False
+    token = '<|endoftext|>'
+    token_id = tokenizer.convert_tokens_to_ids(token)
+    if token_id is None or tokenizer.convert_ids_to_tokens(token_id) != token:
+        raise RuntimeError('Pythia tokenizer has no valid end-of-text token')
+    if tokenizer.bos_token_id is None:
+        tokenizer.bos_token = token
+    if tokenizer.eos_token_id is None:
+        tokenizer.eos_token = token
+    if (tokenizer.bos_token_id, tokenizer.eos_token_id) != (token_id, token_id):
+        raise RuntimeError('Could not assign Pythia BOS/EOS boundary tokens')
+    return True
+
+
 def load_wordsprobability_model(model_name, revision=None, hf_model_name=None):
     """Load one wrapper, optionally overriding its Hugging Face repository.
 
@@ -251,6 +271,9 @@ def load_wordsprobability_model(model_name, revision=None, hf_model_name=None):
         wrapper.tokenizer = wrapper_class.tokenizer_cls.from_pretrained(
             loaded_hf_model_name, **pretrained_kwargs
         )
+        # Normalize Pythia boundary metadata before wordsprobability builds
+        # its BOS/EOS vocabulary masks.
+        normalize_pythia_boundary_tokens(model_name, wrapper.tokenizer)
         wrapper.device = wrapper.model.device
         wrapper.bos_token_id = wrapper.tokenizer.bos_token_id
         wrapper.eos_token_id = wrapper.tokenizer.eos_token_id
