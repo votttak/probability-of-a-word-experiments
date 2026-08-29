@@ -7,9 +7,38 @@ explain the gap from Kuribayashi et al.:
 2. word score: corrected surprisal or the historical `surprisal_buggy`;
 3. decoder: logit lens or tuned lens.
 
-Both score families are produced from the same forward pass. The four
-context/decoder extractions are evaluated with both scores, giving eight cells
-per reading-time response.
+## One experiment switchboard
+
+All experiment choices now live in
+`configs/layer_factorial.json`. Edit that one file to select:
+
+- models and reading-time responses (`time`, `paper_time`);
+- passage/sentence context, corrected/buggy scores, and logit/tuned lens;
+- embedding-layer inclusion and the sentence first-token policy;
+- regression mode, lag policy, early-layer threshold, and the
+  transformer-only sensitivity analysis;
+- extraction jobs, CPU threads, pivot size, canonical inputs, and local
+  output roots.
+
+The committed file selects the complete replication grid. Lists are switches:
+for example, `"contexts": ["sentence"]` and
+`"lens_methods": ["tuned-lens"]` run only that selected cell grid.
+Command-line flags remain available as explicit one-run overrides and take
+precedence over the JSON values. Every run manifest records the raw config
+path/hash, the fully resolved effective settings/hash, and which CLI options
+overrode the file.
+
+Inspect values without copying them into shell scripts:
+
+```bash
+python src/h01_data/layer_factorial_config.py \
+  --get switches.responses
+python src/h01_data/layer_factorial_config.py --list-models
+```
+
+In the default grid, both score families are produced from the same forward
+pass. The four context/decoder extractions are evaluated with both scores,
+giving eight cells per reading-time response.
 
 ## Settings held fixed
 
@@ -119,7 +148,7 @@ export TUNED_LENS_ROOT="$RUN_ROOT/resources/tuned-lens"
 export TUNED_LENS_PYTHONPATH="$RUN_ROOT/python/tuned-lens-0.2.0"
 mkdir -p "$TUNED_LENS_PYTHONPATH"
 python -m pip install --target "$TUNED_LENS_PYTHONPATH" --no-deps "tuned-lens==0.2.0"
-python scripts/stage_layer_factorial_resources.py --all --lens-root "$TUNED_LENS_ROOT" --hf-home "$HF_HOME"
+python scripts/stage_layer_factorial_resources.py --all --config configs/layer_factorial.json --lens-root "$TUNED_LENS_ROOT" --hf-home "$HF_HOME"
 ```
 
 The active environment must provide `wordsprobability==0.17`. The
@@ -130,7 +159,7 @@ Verify every staged resource without network access:
 export PYTHONPATH=$TUNED_LENS_PYTHONPATH:$PYTHONPATH
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-python scripts/stage_layer_factorial_resources.py --all --verify-only --lens-root "$TUNED_LENS_ROOT" --hf-home "$HF_HOME"
+python scripts/stage_layer_factorial_resources.py --all --config configs/layer_factorial.json --verify-only --lens-root "$TUNED_LENS_ROOT" --hf-home "$HF_HOME"
 ```
 
 The staged lenses come from immutable `AlignmentResearch/tuned-lens`
@@ -176,8 +205,9 @@ writes:
   `$RUN_ROOT/results/layer-factorial/MODEL/combined/REPORT.md`;
 - timestamped logs under `$RUN_ROOT/logs/layer-factorial/MODEL/`.
 
-Both `time` and `paper_time` are evaluated for all eight
-context/score/lens cells. The output validator must pass before any regression
+With the committed configuration, both `time` and `paper_time` are evaluated
+for all eight context/score/lens cells. A reduced switch selection evaluates
+only its requested grid. The output validator must pass before any regression
 is fitted.
 
 ## Cross-model analysis
@@ -186,27 +216,41 @@ After all selected per-model combined reports exist, run the strict
 cross-model postprocessor:
 
     python src/h03_paper/analyze_cross_model_layer_factorial.py \
+      --config configs/layer_factorial.json \
       --run-root "$RUN_ROOT" \
       --output-dir "$RUN_ROOT/results/layer-factorial/cross_model_analysis"
 
 The same command works on a relocated compact archive when --run-root
 points to the extracted directory containing both results/layer-factorial
-and checkpoints/layer-factorial. By default it requires the full pinned
-nine-model registry. An explicit --models subset is available for testing
-or partial diagnostics.
+and checkpoints/layer-factorial. It requires the models and factorial cells
+selected by the configuration. An explicit `--models` subset remains available
+for testing or partial diagnostics.
 
-The postprocessor independently revalidates every full layer curve, recomputes
-each exact delta-LL argmax, reconciles the stored best-layer tables and
-summaries, checks registry depths and pinned revisions, verifies the archived
-extraction-validation hashes, and requires shared text, RT, frequency, and
-sentence-manifest hashes across models.
+For modern manifests, the postprocessor uses the common effective scientific
+setup recorded by the runner. This means explicit runner overrides such as
+`--contexts sentence` or `--early-layer-threshold 0.1` remain analyzable
+without editing the source JSON after the run. It verifies the raw config hash,
+the canonical effective-config hash, and the corresponding recorded CLI option,
+and requires every selected model to have identical effective scientific
+settings. A mixed set of modern and legacy manifests is rejected. A fully
+legacy archive with no configuration metadata continues to use the supplied
+JSON settings.
 
-It reports two layer scopes:
+The postprocessor independently revalidates every selected layer curve,
+recomputes each exact delta-LL argmax, reconciles the stored best-layer tables
+and summaries, checks registry depths and pinned revisions, verifies the
+archived extraction-validation hashes, and requires shared text, RT,
+frequency, and sentence-manifest hashes across models.
+
+It always reports the including-embedding scope when layer 0 is selected. The
+`analysis.transformer_only_sensitivity` switch optionally adds the
+transformer-only scope. If layer 0 is disabled, transformer-only is the sole
+scope:
 
 - **including-embedding**, matching the extraction grid with layer 0 eligible;
 - **transformer-only**, which excludes layer 0, recomputes the argmax over
   layers 1 through D, and retains the architectural depth definition
-  layer / D <= 0.2.
+  `layer / D <= analysis.early_layer_threshold`.
 
 ## Full nine-model result
 

@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import csv
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -25,6 +26,11 @@ from h01_data.layer_factorial_models import (  # noqa: E402
     get_model_spec as get_factorial_model_spec,
     model_aliases as factorial_model_aliases,
 )
+from h01_data.layer_factorial_config import (  # noqa: E402
+    DEFAULT_CONFIG_PATH,
+    load_layer_factorial_config,
+    resolve_config_path,
+)
 
 EXTRACTOR = REPOSITORY_ROOT / "src/h01_data/get_internal_layer_surprisals.py"
 MERGER = REPOSITORY_ROOT / "src/h01_data/build_layer_factorial_dataset.py"
@@ -39,6 +45,7 @@ ANALYZER = (
 VALIDATOR = REPOSITORY_ROOT / "scripts/validate_layer_factorial_outputs.py"
 CONTEXTS = ("passage", "sentence")
 LENSES = ("logit-lens", "tuned-lens")
+SCORE_KINDS = ("corrected", "buggy")
 
 
 def sha256_file(path):
@@ -47,6 +54,13 @@ def sha256_file(path):
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def sha256_json(payload):
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def resolve_repo_path(value):
@@ -149,41 +163,69 @@ def validate_extraction_matches_run(
         0 if args.include_embedding_layer else 1,
     )
     _require_equal(
+        "contexts",
+        set(expected.get("contexts", [])),
+        set(args.contexts),
+    )
+    _require_equal(
+        "lens methods",
+        set(expected.get("lens_methods", [])),
+        set(args.lens_methods),
+    )
+    extraction_score_kinds = ["corrected"]
+    if "buggy" in args.score_kinds:
+        extraction_score_kinds.append("buggy")
+    _require_equal(
+        "extraction score kinds",
+        expected.get("score_kinds"),
+        extraction_score_kinds,
+    )
+    expected_sentence_hash = (
+        sha256_file(args.sentence_manifest_fname)
+        if "sentence" in args.contexts
+        else None
+    )
+    _require_equal(
         "sentence manifest hash",
         validation.get("sentence_manifest_sha256"),
-        sha256_file(args.sentence_manifest_fname),
+        expected_sentence_hash,
     )
 
     lens_identity = validation.get("tuned_lens_identity")
-    if not isinstance(lens_identity, dict):
-        raise ValueError(
-            "extraction validation manifest lacks tuned-lens identity"
+    if "tuned-lens" in args.lens_methods:
+        if not isinstance(lens_identity, dict):
+            raise ValueError(
+                "extraction validation manifest lacks tuned-lens identity"
+            )
+        artifact = lens_identity.get("artifact", lens_identity)
+        if not isinstance(artifact, dict):
+            raise ValueError(
+                "extraction validation tuned-lens artifact must be an object"
+            )
+        _require_equal(
+            "tuned-lens config hash",
+            artifact.get("config_sha256"),
+            sha256_file(Path(args.tuned_lens_path) / "config.json"),
         )
-    artifact = lens_identity.get("artifact", lens_identity)
-    if not isinstance(artifact, dict):
-        raise ValueError(
-            "extraction validation tuned-lens artifact must be an object"
+        _require_equal(
+            "tuned-lens parameter hash",
+            artifact.get("params_sha256"),
+            sha256_file(Path(args.tuned_lens_path) / "params.pt"),
         )
-    _require_equal(
-        "tuned-lens config hash",
-        artifact.get("config_sha256"),
-        sha256_file(Path(args.tuned_lens_path) / "config.json"),
-    )
-    _require_equal(
-        "tuned-lens parameter hash",
-        artifact.get("params_sha256"),
-        sha256_file(Path(args.tuned_lens_path) / "params.pt"),
-    )
-    _require_equal(
-        "tuned-lens base model",
-        artifact.get("base_model_name_or_path"),
-        model_spec.hf_name,
-    )
-    _require_equal(
-        "tuned-lens base revision",
-        artifact.get("base_model_revision"),
-        model_spec.lens_base_model_revision,
-    )
+        _require_equal(
+            "tuned-lens base model",
+            artifact.get("base_model_name_or_path"),
+            model_spec.hf_name,
+        )
+        _require_equal(
+            "tuned-lens base revision",
+            artifact.get("base_model_revision"),
+            model_spec.lens_base_model_revision,
+        )
+    elif lens_identity is not None:
+        raise ValueError(
+            "extraction validation unexpectedly contains a tuned-lens identity"
+        )
 
     for (context, lens), extraction_path in extraction_paths.items():
         anchor = read_json_object(
@@ -217,7 +259,7 @@ def validate_extraction_matches_run(
                 args.sentence_first_token_policy,
             )
 
-    reference_path = extraction_paths[("passage", "logit-lens")]
+    reference_path = next(iter(extraction_paths.values()))
     try:
         with Path(reference_path).open(
             "r", encoding="utf8", newline=""
@@ -346,10 +388,11 @@ def extraction_command(args, context, lens, model_spec, cell_dir):
         context,
         "--lens-method",
         lens,
-        "--return-buggy-surprisals",
         "--passage-checkpoint-dir",
         cell_dir / "passage-checkpoints",
     ]
+    if "buggy" in args.score_kinds:
+        command.append("--return-buggy-surprisals")
     if args.include_embedding_layer:
         command.append("--include-embedding-layer")
     if context == "sentence":
@@ -364,19 +407,36 @@ def extraction_command(args, context, lens, model_spec, cell_dir):
     return command
 
 
-def parse_args():
+def _explicit_cli_options(argv):
+    return sorted({
+        token.split("=", 1)[0]
+        for token in argv
+        if token.startswith("--")
+    })
+
+
+def parse_args(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument(
+        "--config", default=str(DEFAULT_CONFIG_PATH)
+    )
+    config_args, _ = config_parser.parse_known_args(argv)
+    config = load_layer_factorial_config(config_args.config)
+
     parser = argparse.ArgumentParser(
         description=(
-            "Run passage/sentence by corrected/buggy by logit/tuned-lens "
-            "internal-layer evaluation in an isolated output root"
+            "Run a configured context by score by decoder internal-layer "
+            "evaluation in an isolated output root"
         )
     )
+    parser.add_argument("--config", default=str(config.source_path))
     parser.add_argument(
-        "--model", choices=factorial_model_aliases(), default="gpt2-small"
+        "--model", choices=factorial_model_aliases(), default=config.models[0]
     )
-    parser.add_argument("--text-fname", required=True)
-    parser.add_argument("--sentence-manifest-fname", required=True)
-    parser.add_argument("--joint-data-fname", required=True)
+    parser.add_argument("--text-fname")
+    parser.add_argument("--sentence-manifest-fname")
+    parser.add_argument("--joint-data-fname")
     parser.add_argument("--paper-rt-fname")
     parser.add_argument(
         "--precomputed-frequency-fname",
@@ -385,50 +445,142 @@ def parse_args():
             "dependency and is recorded in the run manifest"
         ),
     )
-    parser.add_argument("--tuned-lens-path", required=True)
+    parser.add_argument("--tuned-lens-path")
     parser.add_argument("--tuned-lens-pythonpath")
     parser.add_argument("--wordfreq-pythonpath")
-    parser.add_argument("--checkpoint-root", required=True)
-    parser.add_argument("--results-root", required=True)
+    parser.add_argument("--checkpoint-root")
+    parser.add_argument("--results-root")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--rscript", default="Rscript")
     parser.add_argument(
         "--include-embedding-layer",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
     )
+    parser.add_argument("--contexts", nargs="+", choices=CONTEXTS)
+    parser.add_argument("--lens-methods", nargs="+", choices=LENSES)
+    parser.add_argument("--score-kinds", nargs="+", choices=SCORE_KINDS)
     parser.add_argument(
         "--sentence-first-token-policy",
         choices=("bos", "bow"),
-        default="bow",
+        default=None,
     )
     parser.add_argument(
         "--analysis-mode",
         choices=("paper-exact", "project-bridge"),
-        default="paper-exact",
+        default=None,
     )
     parser.add_argument(
-        "--response-columns", nargs="+", default=["time"]
+        "--lag-boundary", choices=("text", "sentence")
     )
-    parser.add_argument("--jobs", type=int, default=1)
-    parser.add_argument("--threads-per-job", type=int, default=4)
     parser.add_argument(
-        "--final-layer-tolerance", type=float, default=5e-4
+        "--lag-padding", choices=("missing", "global-mean")
     )
+    parser.add_argument(
+        "--response-columns",
+        nargs="+",
+        choices=("time", "paper_time"),
+    )
+    parser.add_argument("--jobs", type=int)
+    parser.add_argument("--threads-per-job", type=int)
+    parser.add_argument(
+        "--final-layer-tolerance", type=float
+    )
+    parser.add_argument("--early-layer-threshold", type=float)
     parser.add_argument("--skip-extraction", action="store_true")
     parser.add_argument(
         "--report-note",
-        default=(
-            "The three manipulated factors are extraction context, score "
-            "aggregation, and decoder. Analysis lags are held fixed at "
-            "sentence boundaries with global-mean padding."
-        ),
+        default=None,
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.model not in config.models:
+        parser.error(
+            f"model {args.model!r} is not enabled by {config.source_path}"
+        )
+
+    switches = config.switches
+    extraction = config.extraction
+    analysis = config.analysis
+    runtime = config.runtime
+    args.contexts = list(args.contexts or switches.contexts)
+    args.lens_methods = list(
+        args.lens_methods or switches.lens_methods
+    )
+    args.score_kinds = list(
+        args.score_kinds or switches.score_kinds
+    )
+    args.response_columns = list(
+        args.response_columns or switches.responses
+    )
+    if args.include_embedding_layer is None:
+        args.include_embedding_layer = (
+            switches.include_embedding_layer
+        )
+    args.sentence_first_token_policy = (
+        args.sentence_first_token_policy
+        or extraction.sentence_first_token_policy
+    )
+    args.final_layer_tolerance = (
+        args.final_layer_tolerance
+        if args.final_layer_tolerance is not None
+        else extraction.final_layer_tolerance
+    )
+    args.analysis_mode = args.analysis_mode or analysis.mode
+    args.lag_boundary = args.lag_boundary or analysis.lag_boundary
+    args.lag_padding = args.lag_padding or analysis.lag_padding
+    args.early_layer_threshold = (
+        args.early_layer_threshold
+        if args.early_layer_threshold is not None
+        else analysis.early_layer_threshold
+    )
+    args.jobs = args.jobs if args.jobs is not None else runtime.jobs
+    args.threads_per_job = (
+        args.threads_per_job
+        if args.threads_per_job is not None
+        else runtime.threads_per_job
+    )
+    if args.report_note is None:
+        args.report_note = config.report_note
+
+    configured_paths = {
+        "text_fname": resolve_config_path(config, "text"),
+        "sentence_manifest_fname": resolve_config_path(
+            config, "sentence_manifest"
+        ),
+        "joint_data_fname": resolve_config_path(
+            config, "joint_template", model=args.model
+        ),
+        "paper_rt_fname": resolve_config_path(config, "paper_rt"),
+        "precomputed_frequency_fname": resolve_config_path(
+            config, "precomputed_frequency"
+        ),
+        "checkpoint_root": (
+            resolve_config_path(config, "local_checkpoint_root")
+            / f"full-{args.model}"
+        ),
+        "results_root": (
+            resolve_config_path(config, "local_results_root")
+            / f"full-{args.model}"
+        ),
+    }
+    for attribute, value in configured_paths.items():
+        if getattr(args, attribute) is None:
+            setattr(args, attribute, value)
+    args.layer_factorial_config = config
+    args.cli_overrides = _explicit_cli_options(argv)
+    return args
 
 
 def main():
     args = resolve_path_arguments(parse_args())
+    for label, values in (
+        ("contexts", args.contexts),
+        ("lens methods", args.lens_methods),
+        ("score kinds", args.score_kinds),
+        ("response columns", args.response_columns),
+    ):
+        if len(set(values)) != len(values):
+            raise ValueError(f"{label} must not contain duplicates")
     if args.jobs < 1 or args.jobs > 4:
         raise ValueError("--jobs must be between 1 and 4")
     if args.threads_per_job < 1:
@@ -437,12 +589,35 @@ def main():
         raise ValueError(
             "--response-columns paper_time requires --paper-rt-fname"
         )
+    if (
+        args.analysis_mode == "paper-exact"
+        and (
+            args.lag_boundary != "sentence"
+            or args.lag_padding != "global-mean"
+        )
+    ):
+        raise ValueError(
+            "paper-exact analysis requires sentence lag boundaries with "
+            "global-mean padding"
+        )
+    if (
+        not 0 < args.early_layer_threshold <= 1
+        or not math.isfinite(args.early_layer_threshold)
+    ):
+        raise ValueError(
+            "--early-layer-threshold must be finite and in (0, 1]"
+        )
+    if "tuned-lens" in args.lens_methods and not args.tuned_lens_path:
+        raise ValueError(
+            "--lens-methods tuned-lens requires --tuned-lens-path"
+        )
     checkpoint_root = Path(args.checkpoint_root)
     results_root = Path(args.results_root)
     checkpoint_root.mkdir(parents=True, exist_ok=True)
     results_root.mkdir(parents=True, exist_ok=True)
     model_spec = get_factorial_model_spec(args.model)
-    read_lens_config(args.tuned_lens_path, model_spec)
+    if "tuned-lens" in args.lens_methods:
+        read_lens_config(args.tuned_lens_path, model_spec)
     revision = model_spec.base_model_revision
     final_layer = model_spec.final_layer
     expected_word_rows = read_expected_word_rows(args.text_fname)
@@ -463,8 +638,8 @@ def main():
     )
 
     cells = []
-    for context in CONTEXTS:
-        for lens in LENSES:
+    for context in args.contexts:
+        for lens in args.lens_methods:
             name = cell_name(context, lens)
             cell_checkpoint = checkpoint_root / "cells" / name
             cell_checkpoint.mkdir(parents=True, exist_ok=True)
@@ -500,31 +675,28 @@ def main():
     extraction_validation_path = (
         checkpoint_root / "extraction-validation.json"
     )
-    run_command(
-        [
-            args.python,
-            VALIDATOR,
-            "--passage-logit-fname",
-            extraction_paths[("passage", "logit-lens")],
-            "--passage-tuned-fname",
-            extraction_paths[("passage", "tuned-lens")],
-            "--sentence-logit-fname",
-            extraction_paths[("sentence", "logit-lens")],
-            "--sentence-tuned-fname",
-            extraction_paths[("sentence", "tuned-lens")],
-            "--completion-json-fname",
-            extraction_validation_path,
-            "--expected-rows",
-            expected_rows,
-            "--expected-final-layer",
-            final_layer,
-            "--expected-min-layer",
-            0 if args.include_embedding_layer else 1,
-            "--tolerance",
-            args.final_layer_tolerance,
-        ],
-        base_environment,
-    )
+    extraction_score_kinds = ["corrected"]
+    if "buggy" in args.score_kinds:
+        extraction_score_kinds.append("buggy")
+    validator_command = [
+        args.python,
+        VALIDATOR,
+        "--completion-json-fname",
+        extraction_validation_path,
+        "--score-kinds",
+        *extraction_score_kinds,
+        "--expected-rows",
+        expected_rows,
+        "--expected-final-layer",
+        final_layer,
+        "--expected-min-layer",
+        0 if args.include_embedding_layer else 1,
+        "--tolerance",
+        args.final_layer_tolerance,
+    ]
+    for (context, lens), path in extraction_paths.items():
+        validator_command.extend(["--cell", context, lens, path])
+    run_command(validator_command, base_environment)
     validate_extraction_matches_run(
         args,
         extraction_paths,
@@ -558,9 +730,9 @@ def main():
             "--first-token-policy",
             first_policy,
             "--lag-boundary",
-            "sentence",
+            args.lag_boundary,
             "--lag-padding",
-            "global-mean",
+            args.lag_padding,
             "--output-fname",
             merged_path,
         ]
@@ -591,6 +763,8 @@ def main():
                     args.analysis_mode,
                     "--response-column",
                     response,
+                    "--score-kinds",
+                    ",".join(args.score_kinds),
                 ],
                 base_environment,
             )
@@ -615,10 +789,74 @@ def main():
             f"Internal-layer factorial: {args.model}",
             "--note",
             args.report_note,
+            "--config",
+            args.layer_factorial_config.source_path,
+            "--contexts",
+            *args.contexts,
+            "--lens-methods",
+            *args.lens_methods,
+            "--score-kinds",
+            *args.score_kinds,
+            "--response-columns",
+            *args.response_columns,
+            "--early-layer-threshold",
+            args.early_layer_threshold,
         ],
         base_environment,
     )
 
+    effective_config = {
+        "model": args.model,
+        "switches": {
+            "responses": list(args.response_columns),
+            "contexts": list(args.contexts),
+            "lens_methods": list(args.lens_methods),
+            "score_kinds": list(args.score_kinds),
+            "include_embedding_layer": args.include_embedding_layer,
+        },
+        "extraction": {
+            "sentence_first_token_policy": (
+                args.sentence_first_token_policy
+            ),
+            "final_layer_tolerance": args.final_layer_tolerance,
+        },
+        "analysis": {
+            "mode": args.analysis_mode,
+            "lag_boundary": args.lag_boundary,
+            "lag_padding": args.lag_padding,
+            "early_layer_threshold": args.early_layer_threshold,
+            "transformer_only_sensitivity": (
+                args.layer_factorial_config.analysis
+                .transformer_only_sensitivity
+            ),
+        },
+        "runtime": {
+            "jobs": args.jobs,
+            "threads_per_job": args.threads_per_job,
+        },
+        "paths": {
+            "text": str(Path(args.text_fname).resolve()),
+            "sentence_manifest": str(
+                Path(args.sentence_manifest_fname).resolve()
+            ),
+            "joint": str(Path(args.joint_data_fname).resolve()),
+            "paper_rt": (
+                str(Path(args.paper_rt_fname).resolve())
+                if args.paper_rt_fname else None
+            ),
+            "precomputed_frequency": (
+                str(Path(args.precomputed_frequency_fname).resolve())
+                if args.precomputed_frequency_fname else None
+            ),
+            "tuned_lens": (
+                str(Path(args.tuned_lens_path).resolve())
+                if args.tuned_lens_path else None
+            ),
+            "checkpoint_root": str(checkpoint_root.resolve()),
+            "results_root": str(results_root.resolve()),
+        },
+        "report_note": args.report_note,
+    }
     payload = {
         "schema_version": 3,
         "model": args.model,
@@ -629,13 +867,23 @@ def main():
             model_spec.lens_base_model_revision
         ),
         "include_embedding_layer": args.include_embedding_layer,
-        "contexts": list(CONTEXTS),
-        "score_kinds": ["corrected", "buggy"],
-        "lens_methods": list(LENSES),
+        "contexts": list(args.contexts),
+        "score_kinds": list(args.score_kinds),
+        "lens_methods": list(args.lens_methods),
         "analysis_mode": args.analysis_mode,
         "response_columns": args.response_columns,
-        "analysis_lag_boundary": "sentence",
-        "analysis_lag_padding": "global-mean",
+        "analysis_lag_boundary": args.lag_boundary,
+        "analysis_lag_padding": args.lag_padding,
+        "early_layer_threshold": args.early_layer_threshold,
+        "configuration": {
+            "path": str(
+                args.layer_factorial_config.source_path.resolve()
+            ),
+            "sha256": args.layer_factorial_config.source_sha256,
+            "effective_sha256": sha256_json(effective_config),
+            "effective": effective_config,
+            "cli_overrides": args.cli_overrides,
+        },
         "extraction_validation": {
             "path": str(extraction_validation_path.resolve()),
             "sha256": sha256_file(extraction_validation_path),
@@ -653,27 +901,21 @@ def main():
                 "path": str(Path(args.joint_data_fname).resolve()),
                 "sha256": sha256_file(args.joint_data_fname),
             },
-            "tuned_lens_config": {
-                "path": str(
-                    (Path(args.tuned_lens_path) / "config.json").resolve()
-                ),
-                "sha256": sha256_file(
-                    Path(args.tuned_lens_path) / "config.json"
-                ),
-            },
-            "tuned_lens_params": {
-                "path": str(
-                    (Path(args.tuned_lens_path) / "params.pt").resolve()
-                ),
-                "sha256": sha256_file(
-                    Path(args.tuned_lens_path) / "params.pt"
-                ),
-            },
         },
         "combined_report": str(
             (combined_dir / "REPORT.md").resolve()
         ),
     }
+    if "tuned-lens" in args.lens_methods:
+        for name, filename in (
+            ("tuned_lens_config", "config.json"),
+            ("tuned_lens_params", "params.pt"),
+        ):
+            artifact_path = Path(args.tuned_lens_path) / filename
+            payload["inputs"][name] = {
+                "path": str(artifact_path.resolve()),
+                "sha256": sha256_file(artifact_path),
+            }
     if args.paper_rt_fname:
         payload["inputs"]["paper_rt"] = {
             "path": str(Path(args.paper_rt_fname).resolve()),

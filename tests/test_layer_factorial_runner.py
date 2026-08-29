@@ -77,6 +77,9 @@ class LayerFactorialRunnerTest(unittest.TestCase):
             tuned_lens_path=self.lens,
             sentence_first_token_policy="bow",
             text_fname=self.text,
+            contexts=["passage", "sentence"],
+            lens_methods=["logit-lens", "tuned-lens"],
+            score_kinds=["corrected", "buggy"],
         )
 
     def tearDown(self):
@@ -87,7 +90,14 @@ class LayerFactorialRunnerTest(unittest.TestCase):
             "validated": True,
             "model": "gpt2-small",
             "model_revision_effective": "revision",
-            "expected": {"rows": 3, "final_layer": 12, "min_layer": 0},
+            "expected": {
+                "rows": 3,
+                "final_layer": 12,
+                "min_layer": 0,
+                "contexts": ["passage", "sentence"],
+                "lens_methods": ["logit-lens", "tuned-lens"],
+                "score_kinds": ["corrected", "buggy"],
+            },
             "sentence_manifest_sha256": runner.sha256_file(self.manifest),
             "tuned_lens_identity": {
                 "artifact": {
@@ -184,6 +194,7 @@ class LayerFactorialRunnerTest(unittest.TestCase):
             sentence_manifest_fname=self.manifest,
             sentence_first_token_policy="bow",
             tuned_lens_path=self.lens,
+            score_kinds=["corrected", "buggy"],
         )
         spec = SimpleNamespace(
             hf_name="EleutherAI/pythia-70m-deduped",
@@ -199,6 +210,72 @@ class LayerFactorialRunnerTest(unittest.TestCase):
             command[command.index("--model-revision") + 1],
             spec.base_model_revision,
         )
+
+    def test_config_defaults_are_replaced_by_explicit_cli_switches(self):
+        args = runner.parse_args([
+            "--config",
+            str(runner.DEFAULT_CONFIG_PATH),
+            "--no-include-embedding-layer",
+            "--contexts",
+            "sentence",
+            "--response-columns",
+            "paper_time",
+        ])
+        self.assertFalse(args.include_embedding_layer)
+        self.assertEqual(args.contexts, ["sentence"])
+        self.assertEqual(args.response_columns, ["paper_time"])
+        self.assertEqual(args.score_kinds, ["corrected", "buggy"])
+        self.assertIn("--contexts", args.cli_overrides)
+
+    def test_cli_can_enable_embedding_disabled_by_config(self):
+        payload = json.loads(
+            runner.DEFAULT_CONFIG_PATH.read_text(encoding="utf8")
+        )
+        payload["switches"]["include_embedding_layer"] = False
+        config_path = self.root / "config.json"
+        config_path.write_text(json.dumps(payload), encoding="utf8")
+        args = runner.parse_args([
+            "--config",
+            str(config_path),
+            "--include-embedding-layer",
+        ])
+        self.assertTrue(args.include_embedding_layer)
+
+    def test_cli_can_clear_configured_report_note(self):
+        args = runner.parse_args([
+            "--config",
+            str(runner.DEFAULT_CONFIG_PATH),
+            "--report-note",
+            "",
+        ])
+        self.assertEqual(args.report_note, "")
+        self.assertIn("--report-note", args.cli_overrides)
+
+    def test_empty_config_report_note_remains_empty(self):
+        payload = json.loads(
+            runner.DEFAULT_CONFIG_PATH.read_text(encoding="utf8")
+        )
+        payload["report_note"] = ""
+        config_path = self.root / "empty-note-config.json"
+        config_path.write_text(json.dumps(payload), encoding="utf8")
+        args = runner.parse_args(["--config", str(config_path)])
+        self.assertEqual(args.report_note, "")
+
+    def test_corrected_only_extraction_omits_buggy_output_flag(self):
+        args = SimpleNamespace(
+            python="python",
+            model="gpt2-small",
+            text_fname=self.text,
+            include_embedding_layer=True,
+            sentence_manifest_fname=self.manifest,
+            sentence_first_token_policy="bow",
+            tuned_lens_path=self.lens,
+            score_kinds=["corrected"],
+        )
+        command = runner.extraction_command(
+            args, "passage", "logit-lens", self.spec, self.root / "cell"
+        )
+        self.assertNotIn("--return-buggy-surprisals", command)
 
     def test_lens_config_accepts_registry_expected_null_revision(self):
         spec = SimpleNamespace(

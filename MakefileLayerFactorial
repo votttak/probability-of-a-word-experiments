@@ -5,21 +5,22 @@
 
 PYTHON ?= python
 RSCRIPT ?= Rscript
-MODEL ?= gpt2-small
-FACTORIAL_JOBS ?= 1
-FACTORIAL_THREADS_PER_JOB ?= 4
-PIVOT_SENTENCES_PER_TEXT ?= 2
+LAYER_FACTORIAL_CONFIG ?= configs/layer_factorial.json
+LAYER_FACTORIAL_CONFIG_TOOL := src/h01_data/layer_factorial_config.py
+MODEL ?= $(shell $(PYTHON) $(LAYER_FACTORIAL_CONFIG_TOOL) --config "$(LAYER_FACTORIAL_CONFIG)" --list-models | sed -n '1p')
+FACTORIAL_JOBS ?= $(shell $(PYTHON) $(LAYER_FACTORIAL_CONFIG_TOOL) --config "$(LAYER_FACTORIAL_CONFIG)" --get runtime.jobs)
+FACTORIAL_THREADS_PER_JOB ?= $(shell $(PYTHON) $(LAYER_FACTORIAL_CONFIG_TOOL) --config "$(LAYER_FACTORIAL_CONFIG)" --get runtime.threads_per_job)
+PIVOT_SENTENCES_PER_TEXT ?= $(shell $(PYTHON) $(LAYER_FACTORIAL_CONFIG_TOOL) --config "$(LAYER_FACTORIAL_CONFIG)" --get runtime.pivot_sentences_per_text)
 
-CHECKPOINT_ROOT ?= checkpoints/rt/layer_factorial
-RESULTS_ROOT ?= results/rt/layer_factorial
-FACTORIAL_INPUT_ROOT ?= checkpoints/rt/layer_factorial
+CHECKPOINT_ROOT ?= $(shell $(PYTHON) $(LAYER_FACTORIAL_CONFIG_TOOL) --config "$(LAYER_FACTORIAL_CONFIG)" --resolve-path local_checkpoint_root)
+RESULTS_ROOT ?= $(shell $(PYTHON) $(LAYER_FACTORIAL_CONFIG_TOOL) --config "$(LAYER_FACTORIAL_CONFIG)" --resolve-path local_results_root)
 NATURAL_STORIES_SOURCE ?= .cache/naturalstories-source
 ALIGNED_CONLLX := $(NATURAL_STORIES_SOURCE)/parses/ud/stories-aligned.conllx
-FULL_TEXT_FILE := checkpoints/rt/text_rt_data/natural_stories.txt
-FULL_SENTENCE_MANIFEST := $(FACTORIAL_INPUT_ROOT)/manifests/natural-stories-sentences.tsv
-PAPER_RT_FILE ?= $(FACTORIAL_INPUT_ROOT)/inputs/natural-stories-paper-time.tsv
-PAPER_FREQUENCY_FILE ?= $(FACTORIAL_INPUT_ROOT)/inputs/natural-stories-paper-frequency.tsv
-CANONICAL_JOINT_FILE ?= checkpoints/rt/merged_data/natural_stories-$(MODEL).tsv
+FULL_TEXT_FILE := $(shell $(PYTHON) $(LAYER_FACTORIAL_CONFIG_TOOL) --config "$(LAYER_FACTORIAL_CONFIG)" --resolve-path text)
+FULL_SENTENCE_MANIFEST := $(shell $(PYTHON) $(LAYER_FACTORIAL_CONFIG_TOOL) --config "$(LAYER_FACTORIAL_CONFIG)" --resolve-path sentence_manifest)
+PAPER_RT_FILE ?= $(shell $(PYTHON) $(LAYER_FACTORIAL_CONFIG_TOOL) --config "$(LAYER_FACTORIAL_CONFIG)" --resolve-path paper_rt)
+PAPER_FREQUENCY_FILE ?= $(shell $(PYTHON) $(LAYER_FACTORIAL_CONFIG_TOOL) --config "$(LAYER_FACTORIAL_CONFIG)" --resolve-path precomputed_frequency)
+CANONICAL_JOINT_FILE ?= $(shell $(PYTHON) $(LAYER_FACTORIAL_CONFIG_TOOL) --config "$(LAYER_FACTORIAL_CONFIG)" --resolve-path joint_template --model "$(MODEL)")
 
 # These are explicit local resources. The scorer verifies artifact hashes,
 # architecture, base name, layer count, width, and exact base revision.
@@ -41,7 +42,7 @@ PIVOT_OUTPUTS := $(PIVOT_TEXT_FILE) $(PIVOT_SENTENCE_MANIFEST) $(PIVOT_JOINT_FIL
 
 FORCE:
 
-layer_factorial_inputs: $(FULL_SENTENCE_MANIFEST) $(PAPER_RT_FILE) $(PAPER_FREQUENCY_FILE)
+layer_factorial_inputs: $(LAYER_FACTORIAL_CONFIG) $(FULL_SENTENCE_MANIFEST) $(PAPER_RT_FILE) $(PAPER_FREQUENCY_FILE)
 	$(PYTHON) scripts/prepare_layer_factorial_inputs.py --verify-only --paper-output-fname "$(PAPER_RT_FILE)" --frequency-output-fname "$(PAPER_FREQUENCY_FILE)"
 
 layer_factorial_manifest: $(FULL_SENTENCE_MANIFEST)
@@ -50,11 +51,11 @@ layer_factorial_manifest: $(FULL_SENTENCE_MANIFEST)
 layer_factorial_regenerate_manifest: $(ALIGNED_CONLLX) $(FULL_TEXT_FILE) src/h01_data/build_natural_stories_sentence_manifest.py
 	$(PYTHON) src/h01_data/build_natural_stories_sentence_manifest.py --aligned-conllx-fname "$(ALIGNED_CONLLX)" --canonical-passage-fname "$(FULL_TEXT_FILE)" --output-fname "$(FULL_SENTENCE_MANIFEST)"
 
-$(PIVOT_OUTPUTS) &: FORCE $(FULL_TEXT_FILE) $(FULL_SENTENCE_MANIFEST) $(CANONICAL_JOINT_FILE) src/h01_data/build_layer_factorial_pivot.py
+$(PIVOT_OUTPUTS) &: FORCE $(LAYER_FACTORIAL_CONFIG) $(FULL_TEXT_FILE) $(FULL_SENTENCE_MANIFEST) $(CANONICAL_JOINT_FILE) src/h01_data/build_layer_factorial_pivot.py
 	$(PYTHON) src/h01_data/build_layer_factorial_pivot.py --text-fname "$(FULL_TEXT_FILE)" --sentence-manifest-fname "$(FULL_SENTENCE_MANIFEST)" --joint-data-fname "$(CANONICAL_JOINT_FILE)" --sentences-per-text $(PIVOT_SENTENCES_PER_TEXT) --output-text-fname "$(PIVOT_TEXT_FILE)" --output-sentence-manifest-fname "$(PIVOT_SENTENCE_MANIFEST)" --output-joint-data-fname "$(PIVOT_JOINT_FILE)" --output-metadata-fname "$(PIVOT_SELECTION_JSON)"
 
 layer_factorial_pivot: $(PIVOT_OUTPUTS)
-	$(PYTHON) scripts/run_layer_factorial.py --model "$(MODEL)" --text-fname "$(PIVOT_TEXT_FILE)" --sentence-manifest-fname "$(PIVOT_SENTENCE_MANIFEST)" --joint-data-fname "$(PIVOT_JOINT_FILE)" --paper-rt-fname "$(PAPER_RT_FILE)" --tuned-lens-path "$(TUNED_LENS_PATH)" --tuned-lens-pythonpath "$(TUNED_LENS_PYTHONPATH)" --wordfreq-pythonpath "$(WORDFREQ_PYTHONPATH)" --checkpoint-root "$(CHECKPOINT_ROOT)/$(PIVOT_TAG)/run" --results-root "$(RESULTS_ROOT)/$(PIVOT_TAG)/run" --python "$(PYTHON)" --rscript "$(RSCRIPT)" --jobs $(FACTORIAL_JOBS) --threads-per-job $(FACTORIAL_THREADS_PER_JOB) --response-columns time paper_time --report-note "Local pivot: first $(PIVOT_SENTENCES_PER_TEXT) complete sentences from each Natural Stories text. Use this only as a directional diagnostic."
+	$(PYTHON) scripts/run_layer_factorial.py --config "$(LAYER_FACTORIAL_CONFIG)" --model "$(MODEL)" --text-fname "$(PIVOT_TEXT_FILE)" --sentence-manifest-fname "$(PIVOT_SENTENCE_MANIFEST)" --joint-data-fname "$(PIVOT_JOINT_FILE)" --paper-rt-fname "$(PAPER_RT_FILE)" --tuned-lens-path "$(TUNED_LENS_PATH)" --tuned-lens-pythonpath "$(TUNED_LENS_PYTHONPATH)" --wordfreq-pythonpath "$(WORDFREQ_PYTHONPATH)" --checkpoint-root "$(CHECKPOINT_ROOT)/$(PIVOT_TAG)/run" --results-root "$(RESULTS_ROOT)/$(PIVOT_TAG)/run" --python "$(PYTHON)" --rscript "$(RSCRIPT)" --jobs $(FACTORIAL_JOBS) --threads-per-job $(FACTORIAL_THREADS_PER_JOB) --report-note "Local pivot: first $(PIVOT_SENTENCES_PER_TEXT) complete sentences from each Natural Stories text. Use this only as a directional diagnostic."
 
 layer_factorial_full: layer_factorial_inputs
-	$(PYTHON) scripts/run_layer_factorial.py --model "$(MODEL)" --text-fname "$(FULL_TEXT_FILE)" --sentence-manifest-fname "$(FULL_SENTENCE_MANIFEST)" --joint-data-fname "$(CANONICAL_JOINT_FILE)" --paper-rt-fname "$(PAPER_RT_FILE)" --precomputed-frequency-fname "$(PAPER_FREQUENCY_FILE)" --tuned-lens-path "$(TUNED_LENS_PATH)" --tuned-lens-pythonpath "$(TUNED_LENS_PYTHONPATH)" --checkpoint-root "$(CHECKPOINT_ROOT)/full-$(MODEL)" --results-root "$(RESULTS_ROOT)/full-$(MODEL)" --python "$(PYTHON)" --rscript "$(RSCRIPT)" --jobs $(FACTORIAL_JOBS) --threads-per-job $(FACTORIAL_THREADS_PER_JOB) --response-columns time paper_time --report-note "Full 10,256-word Natural Stories replication grid."
+	$(PYTHON) scripts/run_layer_factorial.py --config "$(LAYER_FACTORIAL_CONFIG)" --model "$(MODEL)" --tuned-lens-path "$(TUNED_LENS_PATH)" --tuned-lens-pythonpath "$(TUNED_LENS_PYTHONPATH)" --checkpoint-root "$(CHECKPOINT_ROOT)/full-$(MODEL)" --results-root "$(RESULTS_ROOT)/full-$(MODEL)" --python "$(PYTHON)" --rscript "$(RSCRIPT)" --jobs $(FACTORIAL_JOBS) --threads-per-job $(FACTORIAL_THREADS_PER_JOB)

@@ -69,6 +69,17 @@ stopifnot(identical(unique(predictors$context), 0:2))
 stopifnot(identical(
   unique(predictors$score_kind), c('corrected', 'buggy')
 ))
+reversed_predictors <- discover_factorial_predictors(
+  synthetic, metadata$include_embedding_layer, c('buggy', 'corrected')
+)
+stopifnot(identical(
+  unique(reversed_predictors$score_kind), c('buggy', 'corrected')
+))
+corrected_predictors <- discover_factorial_predictors(
+  synthetic, metadata$include_embedding_layer, 'corrected'
+)
+stopifnot(nrow(corrected_predictors) == 3L)
+stopifnot(all(corrected_predictors$score_kind == 'corrected'))
 
 reduced <- make_paper_exact_reduced_formula(corrected_0)
 full <- make_paper_exact_full_formula(corrected_0)
@@ -122,6 +133,9 @@ parsed_default <- parse_factorial_cli_args(c(
 ))
 stopifnot(parsed_default$analysis_mode == 'paper-exact')
 stopifnot(parsed_default$response_column == 'time')
+stopifnot(identical(
+  parsed_default$score_kinds, c('corrected', 'buggy')
+))
 parsed_bridge <- parse_factorial_cli_args(c(
   input_fname, layer_fname, best_fname, summary_fname,
   '--response-column', 'paper_time',
@@ -129,6 +143,47 @@ parsed_bridge <- parse_factorial_cli_args(c(
 ))
 stopifnot(parsed_bridge$analysis_mode == 'project-bridge')
 stopifnot(parsed_bridge$response_column == 'paper_time')
+parsed_reversed_score_kinds <- parse_factorial_cli_args(c(
+  input_fname, layer_fname, best_fname, summary_fname,
+  '--score-kinds=buggy, corrected'
+))
+stopifnot(identical(
+  parsed_reversed_score_kinds$score_kinds, c('buggy', 'corrected')
+))
+
+empty_score_kinds_rejected <- tryCatch(
+  {
+    parse_factorial_cli_args(c(
+      input_fname, layer_fname, best_fname, summary_fname,
+      '--score-kinds='
+    ))
+    FALSE
+  },
+  error=function(error) grepl('non-empty', conditionMessage(error))
+)
+stopifnot(empty_score_kinds_rejected)
+duplicate_score_kinds_rejected <- tryCatch(
+  {
+    parse_factorial_cli_args(c(
+      input_fname, layer_fname, best_fname, summary_fname,
+      '--score-kinds', 'corrected,corrected'
+    ))
+    FALSE
+  },
+  error=function(error) grepl('unique', conditionMessage(error))
+)
+stopifnot(duplicate_score_kinds_rejected)
+unsupported_score_kind_rejected <- tryCatch(
+  {
+    parse_factorial_cli_args(c(
+      input_fname, layer_fname, best_fname, summary_fname,
+      '--score-kinds', 'corrected,raw'
+    ))
+    FALSE
+  },
+  error=function(error) grepl('Unsupported score kind', conditionMessage(error))
+)
+stopifnot(unsupported_score_kind_rejected)
 
 result <- run_factorial_kuribayashi_evaluation(
   input_fname, layer_fname, best_fname, summary_fname,
@@ -168,6 +223,15 @@ best_by_kind <- setNames(
 )
 stopifnot(best_by_kind[['corrected']] == 0L)
 stopifnot(best_by_kind[['buggy']] == 1L)
+reversed_selection <- select_factorial_best_layers(
+  result$layers, c('buggy', 'corrected')
+)
+stopifnot(identical(
+  unique(reversed_selection$layers$score_kind), c('buggy', 'corrected')
+))
+stopifnot(identical(
+  reversed_selection$best$score_kind, c('buggy', 'corrected')
+))
 stopifnot(nrow(result$analysis_data) == n - n_sentences)
 stopifnot(all.equal(
   result$analysis_data$time,
@@ -237,6 +301,43 @@ stopifnot(all(bridge_result$layers$is_embedding_layer ==
 missing_buggy <- synthetic[, !grepl(
   'internal_layer_surprisal_buggy_layer_', colnames(synthetic), fixed=TRUE
 )]
+corrected_only_input_fname <- file.path(
+  temporary_dir, 'corrected-only-input.tsv'
+)
+corrected_only_layer_fname <- file.path(
+  temporary_dir, 'corrected-only-layer-results.tsv'
+)
+corrected_only_best_fname <- file.path(
+  temporary_dir, 'corrected-only-best-layers.tsv'
+)
+corrected_only_summary_fname <- file.path(
+  temporary_dir, 'corrected-only-summary.tsv'
+)
+write.table(
+  missing_buggy, corrected_only_input_fname, quote=FALSE, sep='\t',
+  row.names=FALSE, na='NA'
+)
+corrected_only_result <- run_factorial_kuribayashi_evaluation(
+  corrected_only_input_fname, corrected_only_layer_fname,
+  corrected_only_best_fname, corrected_only_summary_fname,
+  score_kinds='corrected'
+)
+stopifnot(nrow(corrected_only_result$layers) == 3L)
+stopifnot(nrow(corrected_only_result$best_layers) == 1L)
+stopifnot(all(corrected_only_result$layers$score_kind == 'corrected'))
+stopifnot(identical(corrected_only_result$score_kinds, 'corrected'))
+corrected_only_summary <- setNames(
+  corrected_only_result$summary$value,
+  corrected_only_result$summary$key
+)
+stopifnot(corrected_only_summary[['score_kinds']] == 'corrected')
+stopifnot(corrected_only_summary[['design']] == 'corrected_factorial')
+stopifnot(corrected_only_summary[['best_layer_corrected']] == '0')
+stopifnot(!'best_layer_buggy' %in% names(corrected_only_summary))
+stopifnot(grepl(
+  'the corrected score kind', corrected_only_summary[['sample_policy']]
+))
+
 missing_buggy_rejected <- tryCatch(
   {
     discover_factorial_predictors(missing_buggy, TRUE)

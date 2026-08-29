@@ -78,8 +78,96 @@ class LayerFactorialResultsTest(unittest.TestCase):
                 row["score_kind"],
             ) != ("passage", "logit-lens", "corrected")
         ]
-        with self.assertRaisesRegex(ValueError, "all eight cells"):
+        with self.assertRaisesRegex(ValueError, "selected 8-cell grid"):
             validate_and_select_best(pd.DataFrame(rows))
+
+    def test_selected_singleton_grid_uses_configured_early_threshold(self):
+        selected_rows = [
+            row
+            for row in make_valid_rows()
+            if (
+                row["context_unit"],
+                row["lens_method"],
+                row["score_kind"],
+                row["response_column"],
+            ) == ("sentence", "logit-lens", "corrected", "time")
+        ]
+        layers, best = validate_and_select_best(
+            pd.DataFrame(selected_rows),
+            contexts=("sentence",),
+            lenses=("logit-lens",),
+            score_kinds=("corrected",),
+            response_columns=("time",),
+            early_threshold=0.6,
+        )
+
+        self.assertEqual(len(layers), 3)
+        self.assertEqual(len(best), 1)
+        self.assertEqual(best["layer"].iloc[0], 1)
+        self.assertEqual(best["layer_fraction_recomputed"].iloc[0], 0.5)
+        self.assertTrue(bool(best["best_in_first_20pct"].iloc[0]))
+        self.assertEqual(layers["context_unit"].unique().tolist(), ["sentence"])
+        self.assertEqual(layers["lens_method"].unique().tolist(), ["logit-lens"])
+        self.assertEqual(layers["score_kind"].unique().tolist(), ["corrected"])
+        self.assertEqual(layers["response_column"].unique().tolist(), ["time"])
+
+    def test_report_uses_dynamic_early_label_and_legacy_machine_key(self):
+        selected_rows = [
+            row
+            for row in make_valid_rows()
+            if (
+                row["context_unit"],
+                row["lens_method"],
+                row["score_kind"],
+            ) == ("sentence", "logit-lens", "corrected")
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source = directory / "layers.tsv"
+            pd.DataFrame(selected_rows).to_csv(
+                source, sep="\t", index=False
+            )
+            _, best, payload = analyze(
+                [source],
+                directory / "combined.tsv",
+                directory / "best.tsv",
+                directory / "REPORT.md",
+                directory / "summary.json",
+                contexts=("sentence",),
+                lenses=("logit-lens",),
+                score_kinds=("corrected",),
+                response_columns=("time",),
+                early_threshold=0.6,
+            )
+            report = (directory / "REPORT.md").read_text(
+                encoding="utf8"
+            )
+
+        self.assertIn("best_in_first_20pct", best.columns)
+        self.assertIn(
+            "best_in_first_20pct", payload["by_response"]["time"]
+        )
+        self.assertIn("Early <= 60% depth", report)
+        self.assertNotIn("Early 20%", report)
+
+    def test_configured_response_order_is_preserved(self):
+        rows = make_valid_rows()
+        rows.extend([
+            {**row, "response_column": "paper_time"}
+            for row in make_valid_rows()
+        ])
+        layers, best = validate_and_select_best(
+            pd.DataFrame(rows),
+            response_columns=("time", "paper_time"),
+        )
+        self.assertEqual(
+            layers["response_column"].drop_duplicates().tolist(),
+            ["time", "paper_time"],
+        )
+        self.assertEqual(
+            best["response_column"].drop_duplicates().tolist(),
+            ["time", "paper_time"],
+        )
 
     def test_layer_ids_must_be_nonnegative_integers(self):
         for value, message in (

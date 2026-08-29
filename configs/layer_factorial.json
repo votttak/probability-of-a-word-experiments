@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "models": [
+    "gpt2-small",
+    "gpt2-large",
+    "gpt2-xl",
+    "pythia-70m",
+    "pythia-160m",
+    "pythia-410m",
+    "pythia-14b",
+    "pythia-28b",
+    "pythia-69b"
+  ],
+  "switches": {
+    "responses": [
+      "time",
+      "paper_time"
+    ],
+    "contexts": [
+      "passage",
+      "sentence"
+    ],
+    "lens_methods": [
+      "logit-lens",
+      "tuned-lens"
+    ],
+    "score_kinds": [
+      "corrected",
+      "buggy"
+    ],
+    "include_embedding_layer": true
+  },
+  "extraction": {
+    "sentence_first_token_policy": "bow",
+    "final_layer_tolerance": 0.0005
+  },
+  "analysis": {
+    "mode": "paper-exact",
+    "lag_boundary": "sentence",
+    "lag_padding": "global-mean",
+    "early_layer_threshold": 0.2,
+    "transformer_only_sensitivity": true
+  },
+  "runtime": {
+    "jobs": 1,
+    "threads_per_job": 4,
+    "pivot_sentences_per_text": 2
+  },
+  "paths": {
+    "text": "checkpoints/rt/text_rt_data/natural_stories.txt",
+    "sentence_manifest": "checkpoints/rt/layer_factorial/manifests/natural-stories-sentences.tsv",
+    "paper_rt": "checkpoints/rt/layer_factorial/inputs/natural-stories-paper-time.tsv",
+    "precomputed_frequency": "checkpoints/rt/layer_factorial/inputs/natural-stories-paper-frequency.tsv",
+    "joint_template": "checkpoints/rt/merged_data/natural_stories-{model}.tsv",
+    "local_checkpoint_root": "checkpoints/rt/layer_factorial",
+    "local_results_root": "results/rt/layer_factorial"
+  },
+  "report_note": "The factorial contrasts extraction context, score aggregation, and decoder. Response measures and analysis lag behavior are selected by this configuration."
+}

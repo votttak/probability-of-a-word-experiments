@@ -25,6 +25,8 @@ factorial_metadata_columns <- c(
 
 factorial_analysis_modes <- c('paper-exact', 'project-bridge')
 
+factorial_default_score_kinds <- factorial_score_specs$score_kind
+
 paper_exact_control_variables <- c(
   'length', 'log_gmean_freq',
   'length_prev_1', 'log_gmean_freq_prev_1',
@@ -118,10 +120,56 @@ validate_factorial_layer_family <- function(layers, include_embedding_layer) {
 }
 
 
-discover_factorial_predictors <- function(df, include_embedding_layer) {
-  families <- vector('list', nrow(factorial_score_specs))
-  for (index in seq_len(nrow(factorial_score_specs))) {
-    spec <- factorial_score_specs[index, , drop=FALSE]
+validate_factorial_score_kinds <- function(score_kinds) {
+  if (!is.character(score_kinds) || length(score_kinds) == 0L ||
+      any(is.na(score_kinds))) {
+    stop('score_kinds must contain at least one score kind')
+  }
+  score_kinds <- trimws(score_kinds)
+  if (any(score_kinds == '')) {
+    stop('score_kinds must not contain empty values')
+  }
+  if (anyDuplicated(score_kinds)) {
+    stop('score_kinds must contain unique values')
+  }
+  unsupported <- setdiff(score_kinds, factorial_score_specs$score_kind)
+  if (length(unsupported) > 0L) {
+    stop(paste(
+      'Unsupported score kind(s):', paste(unsupported, collapse=', '),
+      '; supported values are',
+      paste(factorial_score_specs$score_kind, collapse=', ')
+    ))
+  }
+  score_kinds
+}
+
+
+parse_factorial_score_kinds <- function(value) {
+  if (length(value) != 1L || is.na(value) || trimws(value) == '') {
+    stop('score-kinds must be a non-empty comma-separated list')
+  }
+  if (grepl(',\\s*$', value)) {
+    stop('score-kinds must not contain empty values')
+  }
+  validate_factorial_score_kinds(strsplit(value, ',', fixed=TRUE)[[1]])
+}
+
+
+select_factorial_score_specs <- function(score_kinds) {
+  score_kinds <- validate_factorial_score_kinds(score_kinds)
+  factorial_score_specs[
+    match(score_kinds, factorial_score_specs$score_kind), , drop=FALSE
+  ]
+}
+
+
+discover_factorial_predictors <- function(
+    df, include_embedding_layer,
+    score_kinds=factorial_default_score_kinds) {
+  score_specs <- select_factorial_score_specs(score_kinds)
+  families <- vector('list', nrow(score_specs))
+  for (index in seq_len(nrow(score_specs))) {
+    spec <- score_specs[index, , drop=FALSE]
     layers <- validate_factorial_layer_family(
       discover_predictors(df, spec$predictor_prefix[[1]]),
       include_embedding_layer
@@ -138,7 +186,7 @@ discover_factorial_predictors <- function(df, include_embedding_layer) {
     logical(1)
   )
   if (!all(same_layer_range)) {
-    stop('Corrected and buggy predictors must have the same layer range')
+    stop('Requested score-kind predictors must have the same layer range')
   }
 
   predictors <- do.call(rbind, families)
@@ -432,11 +480,21 @@ append_factorial_metadata <- function(row, metadata, analysis_mode,
 }
 
 
-select_factorial_best_layers <- function(layer_results) {
+select_factorial_best_layers <- function(
+    layer_results, score_kinds=factorial_default_score_kinds) {
+  score_kinds <- validate_factorial_score_kinds(score_kinds)
+  layer_results <- layer_results[
+    layer_results$score_kind %in% score_kinds, , drop=FALSE
+  ]
+  score_order <- match(layer_results$score_kind, score_kinds)
+  layer_results <- layer_results[
+    order(score_order, layer_results$layer), , drop=FALSE
+  ]
+  rownames(layer_results) <- NULL
   layer_results$is_best_layer <- FALSE
-  best_rows <- vector('list', nrow(factorial_score_specs))
-  for (index in seq_len(nrow(factorial_score_specs))) {
-    score_kind <- factorial_score_specs$score_kind[[index]]
+  best_rows <- vector('list', length(score_kinds))
+  for (index in seq_along(score_kinds)) {
+    score_kind <- score_kinds[[index]]
     candidates <- which(layer_results$score_kind == score_kind)
     if (length(candidates) == 0L) {
       stop(paste('No evaluated layers for score kind', score_kind))
@@ -450,11 +508,25 @@ select_factorial_best_layers <- function(layer_results) {
 }
 
 
+factorial_score_kind_scope <- function(score_kinds) {
+  score_kinds <- validate_factorial_score_kinds(score_kinds)
+  if (length(score_kinds) == 1L) {
+    return(paste('the', score_kinds[[1]], 'score kind'))
+  }
+  paste0(
+    'the requested score kinds (', paste(score_kinds, collapse=', '), ')'
+  )
+}
+
+
 make_factorial_summary <- function(metadata, analysis_mode, response_column,
                                    predictors,
                                    best_layers, input_rows, analysis_rows,
-                                   preparation) {
+                                   preparation,
+                                   score_kinds=factorial_default_score_kinds) {
+  score_kinds <- validate_factorial_score_kinds(score_kinds)
   best_by_kind <- split(best_layers, best_layers$score_kind)
+  score_scope <- factorial_score_kind_scope(score_kinds)
   if (analysis_mode == 'paper-exact') {
     reduced_template <- paste(
       'time ~ prev_L + prev2_L +', paper_exact_control_formula
@@ -465,7 +537,8 @@ make_factorial_summary <- function(metadata, analysis_mode, response_column,
     sample_policy <- paste(
       'sort by text/sentence/token; mean-pad predictor and control lags at',
       'sentence boundaries; exclude sentence-initial and nonpositive-time',
-      'targets; share one complete finite sample across kinds and layers'
+      'targets; share one complete finite sample across', score_scope,
+      'and all layers'
     )
     lag_policy <- 'global-mean padding at sentence boundaries, matching source code'
   } else {
@@ -476,8 +549,8 @@ make_factorial_summary <- function(metadata, analysis_mode, response_column,
     analysis <- 'kuribayashi_L_nesting'
     controls <- lexical_control_formula
     sample_policy <- paste(
-      'one shared complete finite sample across both score kinds and all',
-      'layers, including current through t-3 L columns'
+      'one shared complete finite sample across', score_scope,
+      'and all layers, including current through t-3 L columns'
     )
     lag_policy <- 'consume the merged input project spillover columns'
   }
@@ -491,17 +564,17 @@ make_factorial_summary <- function(metadata, analysis_mode, response_column,
   )
   values <- c(
     analysis, analysis_mode, response_column,
-    'corrected_by_buggy_factorial',
+    paste0(paste(score_kinds, collapse='_by_'), '_factorial'),
     unlist(metadata[factorial_metadata_columns], use.names=FALSE),
     if (analysis_mode == 'paper-exact') 'sentence' else metadata$lag_boundary,
     if (analysis_mode == 'paper-exact') 'global-mean' else metadata$lag_padding,
-    paste(factorial_score_specs$score_kind, collapse=','),
+    paste(score_kinds, collapse=','),
     input_rows, analysis_rows, input_rows - analysis_rows,
     paste(unique(predictors$context), collapse=','),
     min(predictors$context), max(predictors$context)
   )
 
-  for (score_kind in factorial_score_specs$score_kind) {
+  for (score_kind in score_kinds) {
     best <- best_by_kind[[score_kind]]
     keys <- c(
       keys, paste0('best_layer_', score_kind),
@@ -566,12 +639,14 @@ validate_factorial_paths <- function(input_fname, output_fnames) {
 
 run_factorial_kuribayashi_evaluation <- function(
     input_fname, layer_output_fname, best_output_fname, summary_fname,
-    analysis_mode='paper-exact', response_column='time') {
+    analysis_mode='paper-exact', response_column='time',
+    score_kinds=factorial_default_score_kinds) {
   if (!analysis_mode %in% factorial_analysis_modes) {
     stop(paste(
       'analysis_mode must be one of', paste(factorial_analysis_modes, collapse=', ')
     ))
   }
+  score_kinds <- validate_factorial_score_kinds(score_kinds)
   validate_factorial_paths(
     input_fname, c(layer_output_fname, best_output_fname, summary_fname)
   )
@@ -592,7 +667,7 @@ run_factorial_kuribayashi_evaluation <- function(
   df_raw$time <- df_raw[[response_column]]
   metadata <- read_factorial_metadata(df_raw)
   predictors <- discover_factorial_predictors(
-    df_raw, metadata$include_embedding_layer
+    df_raw, metadata$include_embedding_layer, score_kinds
   )
 
   if (analysis_mode == 'paper-exact') {
@@ -633,20 +708,18 @@ run_factorial_kuribayashi_evaluation <- function(
   }
 
   layer_results <- do.call(rbind, rows)
-  score_order <- match(
-    layer_results$score_kind, factorial_score_specs$score_kind
-  )
+  score_order <- match(layer_results$score_kind, score_kinds)
   layer_results <- layer_results[
     order(score_order, layer_results$layer), , drop=FALSE
   ]
   rownames(layer_results) <- NULL
-  selected <- select_factorial_best_layers(layer_results)
+  selected <- select_factorial_best_layers(layer_results, score_kinds)
   layer_results <- selected$layers
   best_layers <- selected$best
   rownames(best_layers) <- NULL
   summary <- make_factorial_summary(
     metadata, analysis_mode, response_column, predictors, best_layers,
-    input_rows, analysis_rows, preparation
+    input_rows, analysis_rows, preparation, score_kinds
   )
 
   # All computation/validation precedes publication.  The shared writer stages
@@ -657,7 +730,8 @@ run_factorial_kuribayashi_evaluation <- function(
   invisible(list(
     layers=layer_results, best_layers=best_layers, summary=summary,
     analysis_data=df, metadata=metadata, predictors=predictors,
-    preparation=preparation, response_column=response_column
+    preparation=preparation, response_column=response_column,
+    score_kinds=score_kinds
   ))
 }
 
@@ -667,7 +741,8 @@ parse_factorial_cli_args <- function(args) {
     'Usage: rt_vs_internal_layer_factorial_kuribayashi.R',
     'INPUT LAYER_RESULTS BEST_LAYERS SUMMARY',
     '[--analysis-mode paper-exact|project-bridge]',
-    '[--response-column COLUMN]'
+    '[--response-column COLUMN]',
+    '[--score-kinds corrected,buggy]'
   )
   if (length(args) < 4L) {
     stop(usage)
@@ -676,18 +751,21 @@ parse_factorial_cli_args <- function(args) {
   options <- args[-seq_len(4L)]
   mode <- 'paper-exact'
   response_column <- 'time'
+  score_kinds <- factorial_default_score_kinds
   seen <- character()
   index <- 1L
   while (index <= length(options)) {
     option <- options[[index]]
-    if (option %in% c('--analysis-mode', '--response-column')) {
+    if (option %in% c(
+        '--analysis-mode', '--response-column', '--score-kinds')) {
       if (index == length(options)) {
         stop(usage)
       }
       key <- sub('^--', '', option)
       value <- options[[index + 1L]]
       index <- index + 2L
-    } else if (grepl('^--(analysis-mode|response-column)=', option)) {
+    } else if (grepl(
+        '^--(analysis-mode|response-column|score-kinds)=', option)) {
       key <- sub('^--([^=]+)=.*$', '\\1', option)
       value <- sub('^--[^=]+=', '', option)
       index <- index + 1L
@@ -700,8 +778,10 @@ parse_factorial_cli_args <- function(args) {
     seen <- c(seen, key)
     if (key == 'analysis-mode') {
       mode <- value
-    } else {
+    } else if (key == 'response-column') {
       response_column <- value
+    } else {
+      score_kinds <- parse_factorial_score_kinds(value)
     }
   }
   if (!mode %in% factorial_analysis_modes) {
@@ -711,7 +791,8 @@ parse_factorial_cli_args <- function(args) {
     stop(usage)
   }
   list(
-    paths=paths, analysis_mode=mode, response_column=response_column
+    paths=paths, analysis_mode=mode, response_column=response_column,
+    score_kinds=score_kinds
   )
 }
 
@@ -721,7 +802,8 @@ main <- function(args=commandArgs(trailingOnly=TRUE)) {
   run_factorial_kuribayashi_evaluation(
     parsed$paths[[1]], parsed$paths[[2]], parsed$paths[[3]],
     parsed$paths[[4]], analysis_mode=parsed$analysis_mode,
-    response_column=parsed$response_column
+    response_column=parsed$response_column,
+    score_kinds=parsed$score_kinds
   )
 }
 

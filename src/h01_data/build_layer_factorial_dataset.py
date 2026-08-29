@@ -202,12 +202,22 @@ def _validate_layer_scores(
     corrected_ids, corrected_columns = _layer_columns(
         layer, CORRECTED_PREFIX, "corrected"
     )
-    buggy_ids, buggy_columns = _layer_columns(layer, BUGGY_PREFIX, "buggy")
-    if corrected_ids != buggy_ids:
-        raise ValueError(
-            "corrected and buggy layer predictors must have identical layer IDs; "
-            f"corrected={corrected_ids}, buggy={buggy_ids}"
+    buggy_prefixed = [
+        column
+        for column in layer.columns
+        if column.startswith(BUGGY_PREFIX)
+    ]
+    if buggy_prefixed:
+        buggy_ids, buggy_columns = _layer_columns(
+            layer, BUGGY_PREFIX, "buggy"
         )
+        if corrected_ids != buggy_ids:
+            raise ValueError(
+                "corrected and buggy layer predictors must have identical "
+                f"layer IDs; corrected={corrected_ids}, buggy={buggy_ids}"
+            )
+    else:
+        buggy_columns = []
 
     for column in corrected_columns + buggy_columns:
         numeric = pd.to_numeric(layer[column], errors="coerce")
@@ -457,9 +467,11 @@ def _precomputed_frequency_values(
 
     joint_keys = _key_tuples(joint)
     frequency_keys = _key_tuples(frequency)
-    if set(joint_keys) != set(frequency_keys):
+    missing_keys = set(joint_keys) - set(frequency_keys)
+    if missing_keys:
         raise ValueError(
-            "precomputed frequency key coverage differs from canonical joint"
+            "precomputed frequency does not cover every canonical joint key; "
+            f"missing={len(missing_keys)}"
         )
     index = pd.MultiIndex.from_tuples(joint_keys, names=KEY_COLUMNS)
     aligned = (

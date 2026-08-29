@@ -212,6 +212,69 @@ class LayerFactorialDatasetTests(unittest.TestCase):
         self.assertIn(f"{factorial.CORRECTED_PREFIX}1", output)
         self.assertIn(f"{factorial.BUGGY_PREFIX}2", output)
 
+    def test_file_builder_accepts_corrected_only_extraction_table(self):
+        corrected_only = make_layer().drop(
+            columns=[
+                column
+                for column in make_layer().columns
+                if column.startswith(factorial.BUGGY_PREFIX)
+            ]
+        )
+        manifest_rows = [
+            {
+                "text_id": text_id,
+                "sentence_id": sentence.sentence_id,
+                "sentence_word_id": sentence_word_id,
+                "word_id": word_id,
+                "word": word,
+            }
+            for text_id, sentences in make_sentence_map().items()
+            for sentence in sentences
+            for sentence_word_id, (word_id, word) in enumerate(
+                zip(sentence.word_ids, sentence.words)
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            joint_path = directory / "joint.tsv"
+            layer_path = directory / "corrected-only-layer.tsv"
+            manifest_path = directory / "manifest.tsv"
+            output_path = directory / "output.tsv"
+            make_joint().to_csv(joint_path, sep="\t", index=False)
+            corrected_only.to_csv(layer_path, sep="\t", index=False)
+            sentence_manifest.write_manifest(manifest_rows, manifest_path)
+
+            output = factorial.build_layer_factorial_dataset(
+                joint_path,
+                layer_path,
+                manifest_path,
+                output_path,
+                model="fixture-model",
+                context_unit="sentence",
+                lens_method="logit-lens",
+                first_token_policy="bow",
+                lag_boundary="sentence",
+                word_frequency_fn=fake_word_frequency,
+            )
+            self.assertTrue(output_path.is_file())
+
+        corrected_columns = [
+            f"{factorial.CORRECTED_PREFIX}{layer}" for layer in (0, 1)
+        ]
+        for column in corrected_columns:
+            self.assertIn(column, output)
+            for lag_prefix in ("prev_", "prev2_", "prev3_"):
+                self.assertIn(f"{lag_prefix}{column}", output)
+        self.assertFalse(
+            any(
+                factorial.BUGGY_PREFIX in column
+                for column in output.columns
+            )
+        )
+        np.testing.assert_allclose(
+            output[corrected_columns[0]], corrected_only[corrected_columns[0]]
+        )
+
     def test_rejects_mismatched_gapped_and_invalid_layer_families(self):
         mismatched = make_layer()
         mismatched = mismatched.drop(columns=f"{factorial.BUGGY_PREFIX}1")
@@ -296,8 +359,33 @@ class LayerFactorialDatasetTests(unittest.TestCase):
             output["paper_log_gmean_freq"], [-1, -2, -3, -4, -5]
         )
 
+        superset = pd.concat([
+            frequency,
+            pd.DataFrame({
+                "text_id": [3],
+                "word_id": [0],
+                "word": ["unused"],
+                "paper_log_gmean_freq": [-9.0],
+            }),
+        ], ignore_index=True)
+        superset_output = factorial.build_layer_factorial_dataframe(
+            make_joint(),
+            make_layer(),
+            make_sentence_map(),
+            model="fixture",
+            context_unit="sentence",
+            lens_method="logit-lens",
+            first_token_policy="bow",
+            lag_boundary="sentence",
+            frequency_table=superset,
+        )
+        np.testing.assert_allclose(
+            superset_output["paper_log_gmean_freq"],
+            [-1, -2, -3, -4, -5],
+        )
+
         bad = frequency.iloc[:-1].copy()
-        with self.assertRaisesRegex(ValueError, "key coverage differs"):
+        with self.assertRaisesRegex(ValueError, "does not cover every"):
             factorial.build_layer_factorial_dataframe(
                 make_joint(),
                 make_layer(),

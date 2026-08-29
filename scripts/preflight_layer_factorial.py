@@ -271,23 +271,26 @@ def package_version(name: str) -> str:
         raise RuntimeError(f"required package is not installed: {name}") from error
 
 
-def validate_runtime(require_cuda: bool) -> dict:
+def validate_runtime(
+    require_cuda: bool, *, require_tuned_lens: bool = True
+) -> dict:
+    package_names = ["wordsprobability"]
+    if require_tuned_lens:
+        package_names.append("tuned-lens")
+    package_names.extend([
+        "torch",
+        "transformers",
+        "huggingface-hub",
+        "pandas",
+        "numpy",
+    ])
     packages = {
         name: package_version(name)
-        for name in (
-            "wordsprobability",
-            "tuned-lens",
-            "torch",
-            "transformers",
-            "huggingface-hub",
-            "pandas",
-            "numpy",
-        )
+        for name in package_names
     }
-    expected = {
-        "wordsprobability": WORSPROBABILITY_VERSION,
-        "tuned-lens": TUNED_LENS_PACKAGE_VERSION,
-    }
+    expected = {"wordsprobability": WORSPROBABILITY_VERSION}
+    if require_tuned_lens:
+        expected["tuned-lens"] = TUNED_LENS_PACKAGE_VERSION
     for name, wanted in expected.items():
         if packages[name] != wanted:
             raise RuntimeError(
@@ -472,7 +475,13 @@ def parse_args() -> argparse.Namespace:
             "natural-stories-paper-frequency.tsv"
         ),
     )
-    parser.add_argument("--tuned-lens-path", required=True)
+    parser.add_argument("--tuned-lens-path")
+    parser.add_argument(
+        "--lens-methods",
+        nargs="+",
+        choices=("logit-lens", "tuned-lens"),
+        default=("logit-lens", "tuned-lens"),
+    )
     parser.add_argument("--hf-home", default=os.environ.get("HF_HOME"))
     parser.add_argument("--check-runtime", action="store_true")
     parser.add_argument("--require-cuda", action="store_true")
@@ -492,6 +501,12 @@ def main() -> int:
             "--smoke-load requires --check-runtime and --check-model-cache"
         )
     spec = get_model_spec(args.model)
+    if "tuned-lens" in args.lens_methods and not args.tuned_lens_path:
+        raise ValueError(
+            "--lens-methods tuned-lens requires --tuned-lens-path"
+        )
+    if args.smoke_load and "tuned-lens" not in args.lens_methods:
+        raise ValueError("--smoke-load requires tuned-lens selection")
     if args.joint_data_fname is None:
         args.joint_data_fname = (
             f"checkpoints/rt/merged_data/natural_stories-{spec.alias}.tsv"
@@ -502,12 +517,16 @@ def main() -> int:
         "model": spec.alias,
         "base_model_revision": spec.base_model_revision,
         "inputs": validate_inputs(args, spec),
-        "tuned_lens": validate_lens(
-            resolve_path(args.tuned_lens_path), spec
-        ),
     }
+    if "tuned-lens" in args.lens_methods:
+        payload["tuned_lens"] = validate_lens(
+            resolve_path(args.tuned_lens_path), spec
+        )
     if args.check_runtime:
-        payload["runtime"] = validate_runtime(args.require_cuda)
+        payload["runtime"] = validate_runtime(
+            args.require_cuda,
+            require_tuned_lens="tuned-lens" in args.lens_methods,
+        )
     if args.check_model_cache:
         if not args.hf_home:
             raise ValueError("--hf-home or HF_HOME is required for cache checks")

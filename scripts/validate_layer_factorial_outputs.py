@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Validate the four extraction cells in the layer-factorial experiment."""
+"""Validate selected extraction cells in the layer-factorial experiment."""
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping, Sequence
 import hashlib
 import json
 import math
@@ -25,12 +26,20 @@ KEY_COLUMNS = ("text_id", "word_id", "word")
 CORRECTED_PREFIX = "internal_layer_surprisal_layer_"
 BUGGY_PREFIX = "internal_layer_surprisal_buggy_layer_"
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+CONTEXT_UNITS = ("passage", "sentence")
+LENS_METHODS = ("logit-lens", "tuned-lens")
+SCORE_KINDS = ("corrected", "buggy")
+SCORE_PREFIXES = {
+    "corrected": CORRECTED_PREFIX,
+    "buggy": BUGGY_PREFIX,
+}
 CELL_SPECS = {
     "passage_logit": ("passage", "logit-lens"),
     "passage_tuned": ("passage", "tuned-lens"),
     "sentence_logit": ("sentence", "logit-lens"),
     "sentence_tuned": ("sentence", "tuned-lens"),
 }
+CELL_LABELS = {spec: label for label, spec in CELL_SPECS.items()}
 
 
 class ValidationError(ValueError):
@@ -89,17 +98,63 @@ def _columns(prefix: str, layers: tuple[int, ...]) -> list[str]:
     return [f"{prefix}{layer}" for layer in layers]
 
 
+def _normalize_score_kinds(score_kinds: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(score_kinds, (str, bytes)) or not score_kinds:
+        raise ValidationError("score_kinds must be a nonempty sequence")
+    observed = list(score_kinds)
+    invalid = sorted(set(observed) - set(SCORE_KINDS))
+    if invalid:
+        raise ValidationError(
+            "unsupported score kinds: " + ", ".join(invalid)
+        )
+    if len(observed) != len(set(observed)):
+        raise ValidationError("score_kinds must not contain duplicates")
+    return tuple(kind for kind in SCORE_KINDS if kind in observed)
+
+
+def _normalize_cell_paths(
+    cell_paths: Mapping[tuple[str, str], str | Path],
+) -> dict[tuple[str, str], Path]:
+    if not isinstance(cell_paths, Mapping) or not cell_paths:
+        raise ValidationError("cell_paths must be a nonempty mapping")
+    normalized: dict[tuple[str, str], Path] = {}
+    for key, path in cell_paths.items():
+        if not isinstance(key, tuple) or len(key) != 2:
+            raise ValidationError(
+                "cell_paths keys must be (context_unit, lens_method) tuples"
+            )
+        context, lens = key
+        if context not in CONTEXT_UNITS:
+            raise ValidationError(f"unsupported context unit: {context!r}")
+        if lens not in LENS_METHODS:
+            raise ValidationError(f"unsupported lens method: {lens!r}")
+        normalized[(context, lens)] = Path(path)
+    return {
+        (context, lens): normalized[(context, lens)]
+        for context in CONTEXT_UNITS
+        for lens in LENS_METHODS
+        if (context, lens) in normalized
+    }
+
+
 def _validate_table(
-    path: Path, label: str, expected_rows: int, layers: tuple[int, ...]
+    path: Path,
+    label: str,
+    expected_rows: int,
+    layers: tuple[int, ...],
+    score_kinds: tuple[str, ...],
 ) -> pd.DataFrame:
     table = _read_tsv(path, label)
     if len(table) != expected_rows:
         raise ValidationError(
             f"{label} has {len(table)} rows; expected {expected_rows}"
         )
-    corrected = _columns(CORRECTED_PREFIX, layers)
-    buggy = _columns(BUGGY_PREFIX, layers)
-    expected = set(KEY_COLUMNS) | set(corrected) | set(buggy)
+    predictor_columns = [
+        column
+        for score_kind in score_kinds
+        for column in _columns(SCORE_PREFIXES[score_kind], layers)
+    ]
+    expected = set(KEY_COLUMNS) | set(predictor_columns)
     observed = set(table.columns)
     missing, extra = expected - observed, observed - expected
     if missing or extra:
@@ -108,9 +163,12 @@ def _validate_table(
             details.append("missing=" + ",".join(sorted(missing)))
         if extra:
             details.append("extra=" + ",".join(sorted(extra)))
+        family_description = (
+            "dual" if score_kinds == SCORE_KINDS else "selected"
+        )
         raise ValidationError(
-            f"{label} does not contain the exact dual predictor families: "
-            + "; ".join(details)
+            f"{label} does not contain the exact {family_description} "
+            "predictor families: " + "; ".join(details)
         )
 
     table = table.copy().reset_index(drop=True)
@@ -123,7 +181,7 @@ def _validate_table(
     table["word"] = table["word"].astype(str)
     if (table["word"].str.len() == 0).any():
         raise ValidationError(f"{label} contains an empty word")
-    for column in corrected + buggy:
+    for column in predictor_columns:
         values = pd.to_numeric(table[column], errors="coerce").to_numpy(dtype=float)
         if not np.isfinite(values).all():
             raise ValidationError(f"{label} column {column} is not finite")
@@ -134,7 +192,7 @@ def _validate_table(
 
 
 def _assert_key_word_identity(tables: dict[str, pd.DataFrame]) -> None:
-    reference_label = "passage_logit"
+    reference_label = next(iter(tables))
     reference = tables[reference_label]
     reference_keys = reference[["text_id", "word_id"]].to_numpy(dtype=np.int64)
     reference_words = reference["word"].to_numpy(dtype=str)
@@ -178,8 +236,11 @@ def _sha256_identity(value: Any, label: str) -> str:
 
 
 def _validate_anchor_provenance(
-    anchors: dict[str, dict[str, Any]], layers: tuple[int, ...]
-) -> tuple[str, str, dict[str, Any], str]:
+    anchors: dict[str, dict[str, Any]],
+    cell_specs: dict[str, tuple[str, str]],
+    layers: tuple[int, ...],
+    score_kinds: tuple[str, ...],
+) -> tuple[str, str, dict[str, Any] | None, str | None]:
     models: list[str] = []
     revisions: list[str] = []
     tuned_identities: list[dict[str, Any]] = []
@@ -188,7 +249,7 @@ def _validate_anchor_provenance(
         experiment = anchor.get("experiment")
         if not isinstance(experiment, dict):
             raise ValidationError(f"{label} anchor lacks experiment provenance")
-        expected_context, expected_lens = CELL_SPECS[label]
+        expected_context, expected_lens = cell_specs[label]
         if experiment.get("context_unit") != expected_context:
             raise ValidationError(
                 f"{label} anchor context_unit is "
@@ -214,9 +275,9 @@ def _validate_anchor_provenance(
                 f"{label} anchor layers are {experiment.get('layers')!r}; "
                 f"expected {list(layers)!r}"
             )
-        if experiment.get("score_kinds") != ["corrected", "buggy"]:
+        if experiment.get("score_kinds") != list(score_kinds):
             raise ValidationError(
-                f"{label} anchor must identify corrected and buggy score kinds"
+                f"{label} anchor must identify exactly the selected score kinds"
             )
         if experiment.get("include_embedding_layer") is not (layers[0] == 0):
             raise ValidationError(
@@ -279,18 +340,19 @@ def _validate_anchor_provenance(
         json.dumps(value, sort_keys=True, separators=(",", ":"))
         for value in tuned_identities
     ]
-    if len(set(identities)) != 1:
+    if len(set(identities)) > 1:
         raise ValidationError(
             "sentence and passage tuned cells use different artifacts"
         )
-    if len(set(sentence_hashes)) != 1:
+    if len(set(sentence_hashes)) > 1:
         raise ValidationError("sentence cells use different sentence manifests")
-    return models[0], revisions[0], tuned_identities[0], sentence_hashes[0]
+    tuned_identity = tuned_identities[0] if tuned_identities else None
+    sentence_hash = sentence_hashes[0] if sentence_hashes else None
+    return models[0], revisions[0], tuned_identity, sentence_hash
 
 
 def _score_column(score_kind: str, layer: int) -> str:
-    prefix = CORRECTED_PREFIX if score_kind == "corrected" else BUGGY_PREFIX
-    return f"{prefix}{layer}"
+    return f"{SCORE_PREFIXES[score_kind]}{layer}"
 
 
 def _max_abs(left: np.ndarray, right: np.ndarray) -> float:
@@ -298,21 +360,43 @@ def _max_abs(left: np.ndarray, right: np.ndarray) -> float:
 
 
 def _validate_comparisons(
-    tables: dict[str, pd.DataFrame],
+    tables: dict[tuple[str, str], pd.DataFrame],
     layers: tuple[int, ...],
     tolerance: float,
+    score_kinds: tuple[str, ...],
 ) -> dict[str, Any]:
     final_layer = layers[-1]
     intermediate_layers = layers[:-1]
     final_diffs: dict[str, dict[str, float]] = {}
     intermediate_diffs: dict[str, dict[str, float]] = {}
-    for context in ("passage", "sentence"):
-        logit = tables[f"{context}_logit"]
-        tuned = tables[f"{context}_tuned"]
+    unavailable: list[dict[str, Any]] = []
+    selected_contexts = {context for context, _ in tables}
+    selected_lenses = {lens for _, lens in tables}
+    for context in CONTEXT_UNITS:
+        if context not in selected_contexts:
+            continue
+        required = {
+            (context, "logit-lens"),
+            (context, "tuned-lens"),
+        }
+        missing = required - set(tables)
+        if missing:
+            unavailable.append({
+                "comparison": "logit_vs_tuned",
+                "context_unit": context,
+                "missing_cells": [
+                    {"context_unit": cell[0], "lens_method": cell[1]}
+                    for cell in sorted(missing)
+                ],
+                "reason": "requires both logit-lens and tuned-lens",
+            })
+            continue
+        logit = tables[(context, "logit-lens")]
+        tuned = tables[(context, "tuned-lens")]
         final_diffs[context] = {}
         intermediate_diffs[context] = {}
         context_has_intermediate_difference = False
-        for score_kind in ("corrected", "buggy"):
+        for score_kind in score_kinds:
             final_column = _score_column(score_kind, final_layer)
             final_max = _max_abs(
                 logit[final_column].to_numpy(dtype=float),
@@ -340,17 +424,36 @@ def _validate_comparisons(
             )
 
     context_diffs: dict[str, dict[str, float]] = {}
-    for lens in ("logit", "tuned"):
-        passage = tables[f"passage_{lens}"]
-        sentence = tables[f"sentence_{lens}"]
+    for lens_method in LENS_METHODS:
+        if lens_method not in selected_lenses:
+            continue
+        required = {
+            ("passage", lens_method),
+            ("sentence", lens_method),
+        }
+        missing = required - set(tables)
+        if missing:
+            unavailable.append({
+                "comparison": "passage_vs_sentence",
+                "lens_method": lens_method,
+                "missing_cells": [
+                    {"context_unit": cell[0], "lens_method": cell[1]}
+                    for cell in sorted(missing)
+                ],
+                "reason": "requires both passage and sentence contexts",
+            })
+            continue
+        lens = lens_method.removesuffix("-lens")
+        passage = tables[("passage", lens_method)]
+        sentence = tables[("sentence", lens_method)]
         context_diffs[lens] = {}
-        for score_kind in ("corrected", "buggy"):
+        for score_kind in score_kinds:
             column = _score_column(score_kind, final_layer)
             context_diffs[lens][score_kind] = _max_abs(
                 passage[column].to_numpy(dtype=float),
                 sentence[column].to_numpy(dtype=float),
             )
-    if not any(
+    if context_diffs and not any(
         difference > 0.0
         for lens_differences in context_diffs.values()
         for difference in lens_differences.values()
@@ -362,6 +465,7 @@ def _validate_comparisons(
         "final_logit_vs_tuned_max_abs_difference": final_diffs,
         "intermediate_logit_vs_tuned_max_abs_difference": intermediate_diffs,
         "passage_vs_sentence_final_max_abs_difference": context_diffs,
+        "unavailable": unavailable,
     }
 
 
@@ -397,6 +501,106 @@ def write_json_atomic_if_changed(data: dict[str, Any], fname: str | Path) -> Non
         raise
 
 
+def validate_selected_outputs(
+    cell_paths: Mapping[tuple[str, str], str | Path],
+    completion_json_fname: str | Path,
+    *,
+    score_kinds: Sequence[str] = SCORE_KINDS,
+    expected_rows: int = EXPECTED_ROWS,
+    expected_final_layer: int = EXPECTED_FINAL_LAYER,
+    expected_min_layer: int = EXPECTED_MIN_LAYER,
+    tolerance: float = DEFAULT_TOLERANCE,
+) -> dict[str, Any]:
+    """Validate a nonempty selected cell grid and publish its manifest."""
+    _positive_int(expected_rows, "expected rows")
+    layers = _expected_layers(expected_min_layer, expected_final_layer)
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValidationError("tolerance must be finite and nonnegative")
+
+    selected_scores = _normalize_score_kinds(score_kinds)
+    selected_paths = _normalize_cell_paths(cell_paths)
+    cell_specs = {
+        CELL_LABELS[cell]: cell for cell in selected_paths
+    }
+    paths = {
+        CELL_LABELS[cell]: path for cell, path in selected_paths.items()
+    }
+    tables = {
+        label: _validate_table(
+            path, label, expected_rows, layers, selected_scores
+        )
+        for label, path in paths.items()
+    }
+    _assert_key_word_identity(tables)
+
+    anchor_paths: dict[str, Path] = {}
+    anchors: dict[str, dict[str, Any]] = {}
+    for label, path in paths.items():
+        anchor_path, anchor = _read_anchor(path, label)
+        anchor_paths[label] = anchor_path
+        anchors[label] = anchor
+    model, revision, tuned_identity, sentence_hash = _validate_anchor_provenance(
+        anchors, cell_specs, layers, selected_scores
+    )
+    comparisons = _validate_comparisons(
+        {
+            cell_specs[label]: table
+            for label, table in tables.items()
+        },
+        layers,
+        tolerance,
+        selected_scores,
+    )
+
+    artifacts = {
+        label: {
+            "tsv": _artifact_record(paths[label]),
+            "anchor_json": _artifact_record(anchor_paths[label]),
+        }
+        for label in paths
+    }
+    selected_contexts = [
+        context
+        for context in CONTEXT_UNITS
+        if any(cell[0] == context for cell in selected_paths)
+    ]
+    selected_lenses = [
+        lens
+        for lens in LENS_METHODS
+        if any(cell[1] == lens for cell in selected_paths)
+    ]
+    completion = {
+        "schema_version": 1,
+        "validated": True,
+        "model": model,
+        "model_revision_effective": revision,
+        "expected": {
+            "rows": expected_rows,
+            "min_layer": expected_min_layer,
+            "final_layer": expected_final_layer,
+            "layers": list(layers),
+            "final_layer_tolerance": tolerance,
+            "contexts": selected_contexts,
+            "lens_methods": selected_lenses,
+            "score_kinds": list(selected_scores),
+            "cells": [
+                {
+                    "context_unit": context,
+                    "lens_method": lens,
+                    "artifact": CELL_LABELS[(context, lens)],
+                }
+                for context, lens in selected_paths
+            ],
+        },
+        "sentence_manifest_sha256": sentence_hash,
+        "tuned_lens_identity": tuned_identity,
+        "comparisons": comparisons,
+        "artifacts": artifacts,
+    }
+    write_json_atomic_if_changed(completion, completion_json_fname)
+    return completion
+
+
 def validate_outputs(
     passage_logit_fname: str | Path,
     passage_tuned_fname: str | Path,
@@ -409,71 +613,48 @@ def validate_outputs(
     expected_min_layer: int = EXPECTED_MIN_LAYER,
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> dict[str, Any]:
-    """Validate all four cells and atomically publish a completion manifest."""
-    _positive_int(expected_rows, "expected rows")
-    layers = _expected_layers(expected_min_layer, expected_final_layer)
-    if not math.isfinite(tolerance) or tolerance < 0:
-        raise ValidationError("tolerance must be finite and nonnegative")
-
-    paths = {
-        "passage_logit": Path(passage_logit_fname),
-        "passage_tuned": Path(passage_tuned_fname),
-        "sentence_logit": Path(sentence_logit_fname),
-        "sentence_tuned": Path(sentence_tuned_fname),
-    }
-    tables = {
-        label: _validate_table(path, label, expected_rows, layers)
-        for label, path in paths.items()
-    }
-    _assert_key_word_identity(tables)
-
-    anchor_paths: dict[str, Path] = {}
-    anchors: dict[str, dict[str, Any]] = {}
-    for label, path in paths.items():
-        anchor_path, anchor = _read_anchor(path, label)
-        anchor_paths[label] = anchor_path
-        anchors[label] = anchor
-    model, revision, tuned_identity, sentence_hash = _validate_anchor_provenance(
-        anchors, layers
-    )
-    comparisons = _validate_comparisons(tables, layers, tolerance)
-
-    artifacts = {
-        label: {
-            "tsv": _artifact_record(paths[label]),
-            "anchor_json": _artifact_record(anchor_paths[label]),
-        }
-        for label in CELL_SPECS
-    }
-    completion = {
-        "schema_version": 1,
-        "validated": True,
-        "model": model,
-        "model_revision_effective": revision,
-        "expected": {
-            "rows": expected_rows,
-            "min_layer": expected_min_layer,
-            "final_layer": expected_final_layer,
-            "layers": list(layers),
-            "final_layer_tolerance": tolerance,
+    """Validate the legacy full four-cell, dual-score extraction grid."""
+    return validate_selected_outputs(
+        {
+            ("passage", "logit-lens"): passage_logit_fname,
+            ("passage", "tuned-lens"): passage_tuned_fname,
+            ("sentence", "logit-lens"): sentence_logit_fname,
+            ("sentence", "tuned-lens"): sentence_tuned_fname,
         },
-        "sentence_manifest_sha256": sentence_hash,
-        "tuned_lens_identity": tuned_identity,
-        "comparisons": comparisons,
-        "artifacts": artifacts,
-    }
-    write_json_atomic_if_changed(completion, completion_json_fname)
-    return completion
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Validate the four internal-layer factorial extraction cells"
+        completion_json_fname,
+        score_kinds=SCORE_KINDS,
+        expected_rows=expected_rows,
+        expected_final_layer=expected_final_layer,
+        expected_min_layer=expected_min_layer,
+        tolerance=tolerance,
     )
-    parser.add_argument("--passage-logit-fname", required=True)
-    parser.add_argument("--passage-tuned-fname", required=True)
-    parser.add_argument("--sentence-logit-fname", required=True)
-    parser.add_argument("--sentence-tuned-fname", required=True)
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Validate selected internal-layer factorial extraction cells"
+    )
+    parser.add_argument("--passage-logit-fname")
+    parser.add_argument("--passage-tuned-fname")
+    parser.add_argument("--sentence-logit-fname")
+    parser.add_argument("--sentence-tuned-fname")
+    parser.add_argument(
+        "--cell",
+        dest="cells",
+        action="append",
+        nargs=3,
+        metavar=("CONTEXT", "LENS", "PATH"),
+        help=(
+            "selected extraction cell; repeat for each context/lens artifact "
+            "instead of using the four legacy filename options"
+        ),
+    )
+    parser.add_argument(
+        "--score-kinds",
+        nargs="+",
+        choices=SCORE_KINDS,
+        default=list(SCORE_KINDS),
+    )
     parser.add_argument("--completion-json-fname", required=True)
     parser.add_argument("--expected-rows", type=int, default=EXPECTED_ROWS)
     parser.add_argument(
@@ -481,17 +662,53 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--expected-min-layer", type=int, default=EXPECTED_MIN_LAYER)
     parser.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+
+    legacy = {
+        ("passage", "logit-lens"): args.passage_logit_fname,
+        ("passage", "tuned-lens"): args.passage_tuned_fname,
+        ("sentence", "logit-lens"): args.sentence_logit_fname,
+        ("sentence", "tuned-lens"): args.sentence_tuned_fname,
+    }
+    supplied_legacy = [path is not None for path in legacy.values()]
+    if args.cells:
+        if any(supplied_legacy):
+            parser.error(
+                "--cell cannot be combined with the legacy cell filename options"
+            )
+        cell_paths: dict[tuple[str, str], str] = {}
+        for context, lens, path in args.cells:
+            if context not in CONTEXT_UNITS:
+                parser.error(
+                    f"--cell context must be one of {', '.join(CONTEXT_UNITS)}"
+                )
+            if lens not in LENS_METHODS:
+                parser.error(
+                    f"--cell lens must be one of {', '.join(LENS_METHODS)}"
+                )
+            key = (context, lens)
+            if key in cell_paths:
+                parser.error(
+                    f"duplicate --cell for context={context}, lens={lens}"
+                )
+            cell_paths[key] = path
+        args.cell_paths = cell_paths
+    else:
+        if not all(supplied_legacy):
+            parser.error(
+                "provide at least one --cell, or all four legacy cell "
+                "filename options"
+            )
+        args.cell_paths = legacy
+    return args
 
 
 def main() -> None:
     args = parse_args()
-    completion = validate_outputs(
-        args.passage_logit_fname,
-        args.passage_tuned_fname,
-        args.sentence_logit_fname,
-        args.sentence_tuned_fname,
+    completion = validate_selected_outputs(
+        args.cell_paths,
         args.completion_json_fname,
+        score_kinds=args.score_kinds,
         expected_rows=args.expected_rows,
         expected_final_layer=args.expected_final_layer,
         expected_min_layer=args.expected_min_layer,

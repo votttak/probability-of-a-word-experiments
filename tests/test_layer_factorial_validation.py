@@ -12,10 +12,13 @@ import pandas as pd
 
 from scripts.validate_layer_factorial_outputs import (
     BUGGY_PREFIX,
+    CELL_SPECS,
     CORRECTED_PREFIX,
     ValidationError,
+    parse_args,
     sha256_file,
     validate_outputs,
+    validate_selected_outputs,
 )
 
 
@@ -133,6 +136,45 @@ class LayerFactorialValidationTest(unittest.TestCase):
             tolerance=self.TOLERANCE,
         )
 
+    def _validate_selected(self, labels, score_kinds=("corrected", "buggy")):
+        return validate_selected_outputs(
+            {
+                CELL_SPECS[label]: self.paths[label]
+                for label in labels
+            },
+            self.completion,
+            score_kinds=score_kinds,
+            expected_rows=self.ROWS,
+            expected_final_layer=self.FINAL_LAYER,
+            expected_min_layer=self.MIN_LAYER,
+            tolerance=self.TOLERANCE,
+        )
+
+    def _restrict_score_kinds(self, labels, score_kinds):
+        retained_prefixes = {
+            "corrected": CORRECTED_PREFIX,
+            "buggy": BUGGY_PREFIX,
+        }
+        selected_prefixes = {
+            retained_prefixes[score_kind] for score_kind in score_kinds
+        }
+        for label in labels:
+            path = self.paths[label]
+            table = pd.read_csv(path, sep="\t")
+            drop = [
+                column
+                for column in table.columns
+                if column.startswith(tuple(retained_prefixes.values()))
+                and not column.startswith(tuple(selected_prefixes))
+            ]
+            table.drop(columns=drop).to_csv(path, sep="\t", index=False)
+            self._mutate_anchor(
+                label,
+                lambda experiment: experiment.update(
+                    score_kinds=list(score_kinds)
+                ),
+            )
+
     def _mutate_anchor(self, label, mutate):
         path = Path(f"{self.paths[label]}.anchor.json")
         anchor = json.loads(path.read_text(encoding="utf8"))
@@ -165,6 +207,163 @@ class LayerFactorialValidationTest(unittest.TestCase):
         inode = self.completion.stat().st_ino
         self.assertEqual(self._validate(), result)
         self.assertEqual(self.completion.stat().st_ino, inode)
+
+    def test_selected_single_cell_records_unavailable_comparisons(self):
+        result = self._validate_selected(("passage_logit",))
+        self.assertEqual(result["expected"]["contexts"], ["passage"])
+        self.assertEqual(result["expected"]["lens_methods"], ["logit-lens"])
+        self.assertEqual(set(result["artifacts"]), {"passage_logit"})
+        self.assertIsNone(result["sentence_manifest_sha256"])
+        self.assertIsNone(result["tuned_lens_identity"])
+        self.assertEqual(
+            result["comparisons"][
+                "final_logit_vs_tuned_max_abs_difference"
+            ],
+            {},
+        )
+        self.assertEqual(
+            result["comparisons"][
+                "passage_vs_sentence_final_max_abs_difference"
+            ],
+            {},
+        )
+        self.assertEqual(
+            {
+                item["comparison"]
+                for item in result["comparisons"]["unavailable"]
+            },
+            {"logit_vs_tuned", "passage_vs_sentence"},
+        )
+
+    def test_selected_decoder_pair_runs_only_available_checks(self):
+        result = self._validate_selected(
+            ("passage_logit", "passage_tuned")
+        )
+        self.assertEqual(
+            set(result["comparisons"][
+                "final_logit_vs_tuned_max_abs_difference"
+            ]),
+            {"passage"},
+        )
+        self.assertEqual(
+            result["comparisons"][
+                "passage_vs_sentence_final_max_abs_difference"
+            ],
+            {},
+        )
+        self.assertEqual(
+            [
+                item["comparison"]
+                for item in result["comparisons"]["unavailable"]
+            ],
+            ["passage_vs_sentence", "passage_vs_sentence"],
+        )
+        self.assertIsNotNone(result["tuned_lens_identity"])
+        self.assertIsNone(result["sentence_manifest_sha256"])
+
+    def test_selected_context_pair_runs_only_available_checks(self):
+        result = self._validate_selected(
+            ("passage_logit", "sentence_logit")
+        )
+        self.assertEqual(
+            result["comparisons"][
+                "final_logit_vs_tuned_max_abs_difference"
+            ],
+            {},
+        )
+        self.assertEqual(
+            set(result["comparisons"][
+                "passage_vs_sentence_final_max_abs_difference"
+            ]),
+            {"logit"},
+        )
+        self.assertEqual(
+            [
+                item["comparison"]
+                for item in result["comparisons"]["unavailable"]
+            ],
+            ["logit_vs_tuned", "logit_vs_tuned"],
+        )
+        self.assertIsNone(result["tuned_lens_identity"])
+        self.assertEqual(result["sentence_manifest_sha256"], "c" * 64)
+
+    def test_selected_score_kinds_are_exact_in_table_and_anchor(self):
+        labels = ("sentence_logit",)
+        self._restrict_score_kinds(labels, ("corrected",))
+        result = self._validate_selected(labels, ("corrected",))
+        self.assertEqual(result["expected"]["score_kinds"], ["corrected"])
+
+        path = self.paths["sentence_logit"]
+        table = pd.read_csv(path, sep="\t")
+        table[f"{BUGGY_PREFIX}1"] = 1.0
+        table.to_csv(path, sep="\t", index=False)
+        with self.assertRaisesRegex(ValidationError, "exact selected"):
+            self._validate_selected(labels, ("corrected",))
+
+        table.drop(columns=[f"{BUGGY_PREFIX}1"]).to_csv(
+            path, sep="\t", index=False
+        )
+        self._mutate_anchor(
+            "sentence_logit",
+            lambda experiment: experiment.update(
+                score_kinds=["corrected", "buggy"]
+            ),
+        )
+        with self.assertRaisesRegex(ValidationError, "selected score kinds"):
+            self._validate_selected(labels, ("corrected",))
+
+    def test_selected_buggy_only_family_is_supported(self):
+        labels = ("passage_tuned",)
+        self._restrict_score_kinds(labels, ("buggy",))
+        result = self._validate_selected(labels, ("buggy",))
+        self.assertEqual(result["expected"]["score_kinds"], ["buggy"])
+        self.assertEqual(set(result["artifacts"]), {"passage_tuned"})
+        self.assertIsNotNone(result["tuned_lens_identity"])
+
+    def test_cli_accepts_selected_and_legacy_cell_forms(self):
+        selected = parse_args([
+            "--cell",
+            "passage",
+            "logit-lens",
+            str(self.paths["passage_logit"]),
+            "--cell",
+            "sentence",
+            "tuned-lens",
+            str(self.paths["sentence_tuned"]),
+            "--score-kinds",
+            "corrected",
+            "--completion-json-fname",
+            str(self.completion),
+        ])
+        self.assertEqual(
+            selected.cell_paths,
+            {
+                ("passage", "logit-lens"): str(
+                    self.paths["passage_logit"]
+                ),
+                ("sentence", "tuned-lens"): str(
+                    self.paths["sentence_tuned"]
+                ),
+            },
+        )
+        self.assertEqual(selected.score_kinds, ["corrected"])
+
+        legacy = parse_args([
+            "--passage-logit-fname",
+            str(self.paths["passage_logit"]),
+            "--passage-tuned-fname",
+            str(self.paths["passage_tuned"]),
+            "--sentence-logit-fname",
+            str(self.paths["sentence_logit"]),
+            "--sentence-tuned-fname",
+            str(self.paths["sentence_tuned"]),
+            "--completion-json-fname",
+            str(self.completion),
+        ])
+        self.assertEqual(
+            legacy.cell_paths[("sentence", "tuned-lens")],
+            str(self.paths["sentence_tuned"]),
+        )
 
     def test_rejects_key_or_word_mismatch(self):
         for column, replacement, message in (

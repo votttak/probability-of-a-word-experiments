@@ -10,14 +10,27 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 import tempfile
 
 import pandas as pd
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = REPOSITORY_ROOT / "src"
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
+
+from h01_data.layer_factorial_config import (  # noqa: E402
+    DEFAULT_CONFIG_PATH,
+    load_layer_factorial_config,
+)
+
+
 CONTEXT_ORDER = ("passage", "sentence")
 LENS_ORDER = ("logit-lens", "tuned-lens")
 SCORE_ORDER = ("corrected", "buggy")
+DEFAULT_EARLY_THRESHOLD = 0.2
 KEY_COLUMNS = (
     "response_column",
     "context_unit",
@@ -80,12 +93,25 @@ def read_results(paths):
     return pd.concat(frames, ignore_index=True, sort=False)
 
 
-def _ordered(dataframe):
+def _ordered(
+    dataframe,
+    *,
+    contexts=CONTEXT_ORDER,
+    lenses=LENS_ORDER,
+    score_kinds=SCORE_ORDER,
+    response_columns=None,
+):
     output = dataframe.copy()
+    responses = (
+        tuple(response_columns)
+        if response_columns is not None
+        else tuple(sorted(output["response_column"].drop_duplicates()))
+    )
     orders = {
-        "context_unit": CONTEXT_ORDER,
-        "lens_method": LENS_ORDER,
-        "score_kind": SCORE_ORDER,
+        "response_column": responses,
+        "context_unit": tuple(contexts),
+        "lens_method": tuple(lenses),
+        "score_kind": tuple(score_kinds),
     }
     for column, values in orders.items():
         output[f"_{column}_order"] = output[column].map(
@@ -93,7 +119,7 @@ def _ordered(dataframe):
         )
     output.sort_values(
         [
-            "response_column",
+            "_response_column_order",
             "_context_unit_order",
             "_lens_method_order",
             "_score_kind_order",
@@ -126,7 +152,22 @@ def _coerce_nonnegative_integers(dataframe, columns):
         dataframe[column] = values.map(int)
 
 
-def validate_and_select_best(layer_results):
+def validate_and_select_best(
+    layer_results,
+    *,
+    contexts=CONTEXT_ORDER,
+    lenses=LENS_ORDER,
+    score_kinds=SCORE_ORDER,
+    response_columns=None,
+    early_threshold=DEFAULT_EARLY_THRESHOLD,
+):
+    contexts = tuple(contexts)
+    lenses = tuple(lenses)
+    score_kinds = tuple(score_kinds)
+    if not contexts or not lenses or not score_kinds:
+        raise ValueError("factor selections must be nonempty")
+    if not math.isfinite(early_threshold) or not 0 < early_threshold <= 1:
+        raise ValueError("early_threshold must be finite and in (0, 1]")
     required = {
         "response_column",
         "context_unit",
@@ -158,9 +199,9 @@ def validate_and_select_best(layer_results):
         if invalid.any():
             raise ValueError(f"{column} contains missing or empty values")
     for column, expected in (
-        ("context_unit", CONTEXT_ORDER),
-        ("lens_method", LENS_ORDER),
-        ("score_kind", SCORE_ORDER),
+        ("context_unit", contexts),
+        ("lens_method", lenses),
+        ("score_kind", score_kinds),
     ):
         invalid_rows = layer_results[column].map(
             lambda value: pd.isna(value) or value not in expected
@@ -242,12 +283,18 @@ def validate_and_select_best(layer_results):
         best["layer"] / best["max_layer"]
     )
     best["best_in_first_20pct"] = (
-        best["layer_fraction_recomputed"] <= 0.2
+        best["layer_fraction_recomputed"] <= early_threshold
     )
 
     expected_per_response = (
-        len(CONTEXT_ORDER) * len(LENS_ORDER) * len(SCORE_ORDER)
+        len(contexts) * len(lenses) * len(score_kinds)
     )
+    if response_columns is not None:
+        observed_responses = set(best["response_column"])
+        if observed_responses != set(response_columns):
+            raise ValueError(
+                "response columns differ from the selected configuration"
+            )
     for response, group in best.groupby("response_column"):
         observed = set(
             zip(
@@ -258,22 +305,44 @@ def validate_and_select_best(layer_results):
         )
         expected = {
             (context, lens, score)
-            for context in CONTEXT_ORDER
-            for lens in LENS_ORDER
-            for score in SCORE_ORDER
+            for context in contexts
+            for lens in lenses
+            for score in score_kinds
         }
         if observed != expected or len(group) != expected_per_response:
             raise ValueError(
-                f"response {response!r} does not contain all eight cells"
+                f"response {response!r} does not contain the selected "
+                f"{expected_per_response}-cell grid"
             )
-    return _ordered(layer_results), _ordered(best)
+    return (
+        _ordered(
+            layer_results,
+            contexts=contexts,
+            lenses=lenses,
+            score_kinds=score_kinds,
+            response_columns=response_columns,
+        ),
+        _ordered(
+            best,
+            contexts=contexts,
+            lenses=lenses,
+            score_kinds=score_kinds,
+            response_columns=response_columns,
+        ),
+    )
 
 
 def format_number(value):
     return f"{float(value):.6g}"
 
 
-def make_report(best, *, title, note):
+def make_report(
+    best,
+    *,
+    title,
+    note,
+    early_threshold=DEFAULT_EARLY_THRESHOLD,
+):
     models = sorted(set(best["model"]))
     modes = sorted(set(best["analysis_mode"]))
     responses = list(dict.fromkeys(best["response_column"]))
@@ -289,6 +358,7 @@ def make_report(best, *, title, note):
     if note:
         lines.extend([note, ""])
 
+    early_label = f"Early <= {100 * early_threshold:g}% depth"
     for response in responses:
         subset = best.loc[best["response_column"] == response]
         early = int(subset["best_in_first_20pct"].sum())
@@ -297,10 +367,12 @@ def make_report(best, *, title, note):
             "",
             (
                 f"{early} of {len(subset)} factorial cells select a layer "
-                "in the first 20% of model depth (layer / D <= 0.2)."
+                f"at or before {100 * early_threshold:g}% of model depth "
+                f"(layer / D <= {early_threshold:g})."
             ),
             "",
-            "| Context | Decoder | Score | Best layer | Layer / D | Delta LL | PPP x1000 | Early 20% |",
+            "| Context | Decoder | Score | Best layer | Layer / D | "
+            f"Delta LL | PPP x1000 | {early_label} |",
             "|---|---|---|---:|---:|---:|---:|:---:|",
         ])
         for row in subset.itertuples(index=False):
@@ -343,13 +415,31 @@ def analyze(
     *,
     title="Internal-layer factorial experiment",
     note="",
+    contexts=CONTEXT_ORDER,
+    lenses=LENS_ORDER,
+    score_kinds=SCORE_ORDER,
+    response_columns=None,
+    early_threshold=DEFAULT_EARLY_THRESHOLD,
 ):
     layers = read_results(layer_result_paths)
-    layers, best = validate_and_select_best(layers)
+    layers, best = validate_and_select_best(
+        layers,
+        contexts=contexts,
+        lenses=lenses,
+        score_kinds=score_kinds,
+        response_columns=response_columns,
+        early_threshold=early_threshold,
+    )
     write_tsv_atomic(layers, output_layer_path)
     write_tsv_atomic(best, output_best_path)
     write_text_atomic(
-        make_report(best, title=title, note=note), output_report_path
+        make_report(
+            best,
+            title=title,
+            note=note,
+            early_threshold=early_threshold,
+        ),
+        output_report_path,
     )
     counts = {
         response: {
@@ -366,6 +456,7 @@ def analyze(
         "analysis_modes": sorted(set(best["analysis_mode"])),
         "layer_rows": len(layers),
         "factorial_cells": len(best),
+        "early_layer_threshold": early_threshold,
         "by_response": counts,
         "inputs": [
             {
@@ -397,7 +488,31 @@ def parse_args():
         "--title", default="Internal-layer factorial experiment"
     )
     parser.add_argument("--note", default="")
-    return parser.parse_args()
+    parser.add_argument(
+        "--config", default=str(DEFAULT_CONFIG_PATH)
+    )
+    parser.add_argument("--contexts", nargs="+", choices=CONTEXT_ORDER)
+    parser.add_argument("--lens-methods", nargs="+", choices=LENS_ORDER)
+    parser.add_argument("--score-kinds", nargs="+", choices=SCORE_ORDER)
+    parser.add_argument("--response-columns", nargs="+")
+    parser.add_argument("--early-layer-threshold", type=float)
+    args = parser.parse_args()
+    config = load_layer_factorial_config(args.config)
+    args.contexts = list(args.contexts or config.switches.contexts)
+    args.lens_methods = list(
+        args.lens_methods or config.switches.lens_methods
+    )
+    args.score_kinds = list(
+        args.score_kinds or config.switches.score_kinds
+    )
+    args.response_columns = list(
+        args.response_columns or config.switches.responses
+    )
+    if args.early_layer_threshold is None:
+        args.early_layer_threshold = (
+            config.analysis.early_layer_threshold
+        )
+    return args
 
 
 def main():
@@ -410,6 +525,11 @@ def main():
         args.output_summary_json_fname,
         title=args.title,
         note=args.note,
+        contexts=args.contexts,
+        lenses=args.lens_methods,
+        score_kinds=args.score_kinds,
+        response_columns=args.response_columns,
+        early_threshold=args.early_layer_threshold,
     )
 
 

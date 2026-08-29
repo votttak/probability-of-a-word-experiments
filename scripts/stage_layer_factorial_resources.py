@@ -22,12 +22,15 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from h01_data.layer_factorial_models import (  # noqa: E402
-    MODEL_SPECS,
     TUNED_LENS_REPOSITORY,
     TUNED_LENS_REPOSITORY_TYPE,
     TUNED_LENS_REVISION,
     get_model_spec,
     model_aliases,
+)
+from h01_data.layer_factorial_config import (  # noqa: E402
+    DEFAULT_CONFIG_PATH,
+    load_layer_factorial_config,
 )
 
 def sha256_file(path: str | Path) -> str:
@@ -186,7 +189,14 @@ def stage_model_snapshot(spec, hub_cache: Path, verify_only: bool, download) -> 
     return snapshot_path
 
 
-def stage_one(spec, lens_root: Path, hub_cache: Path, verify_only: bool) -> None:
+def stage_one(
+    spec,
+    lens_root: Path | None,
+    hub_cache: Path,
+    verify_only: bool,
+    *,
+    include_tuned_lens: bool = True,
+) -> None:
     try:
         from huggingface_hub import hf_hub_download
     except ImportError as error:
@@ -194,42 +204,48 @@ def stage_one(spec, lens_root: Path, hub_cache: Path, verify_only: bool) -> None
             "huggingface_hub is required to stage layer-factorial resources"
         ) from error
 
-    lens_path = lens_root / spec.lens_artifact
-    expected_files = {
-        "config.json": (spec.lens_config_sha256, spec.lens_config_size),
-        "params.pt": (spec.lens_params_sha256, spec.lens_params_size),
-    }
-    if not verify_only:
+    lens_path = None
+    if include_tuned_lens:
+        if lens_root is None:
+            raise ValueError(
+                "lens_root is required when tuned-lens is selected"
+            )
+        lens_path = lens_root / spec.lens_artifact
+        expected_files = {
+            "config.json": (spec.lens_config_sha256, spec.lens_config_size),
+            "params.pt": (spec.lens_params_sha256, spec.lens_params_size),
+        }
+        if not verify_only:
+            for filename, (digest, size) in expected_files.items():
+                source = Path(hf_hub_download(
+                    repo_id=TUNED_LENS_REPOSITORY,
+                    filename=f"lens/{spec.lens_artifact}/{filename}",
+                    repo_type=TUNED_LENS_REPOSITORY_TYPE,
+                    revision=TUNED_LENS_REVISION,
+                    cache_dir=hub_cache,
+                ))
+                verify_file(
+                    source,
+                    expected_hash=digest,
+                    expected_size=size,
+                    label=f"downloaded {spec.alias} {filename}",
+                )
+                copy_atomic(source, lens_path / filename)
+
         for filename, (digest, size) in expected_files.items():
-            source = Path(hf_hub_download(
-                repo_id=TUNED_LENS_REPOSITORY,
-                filename=f"lens/{spec.lens_artifact}/{filename}",
-                repo_type=TUNED_LENS_REPOSITORY_TYPE,
-                revision=TUNED_LENS_REVISION,
-                cache_dir=hub_cache,
-            ))
             verify_file(
-                source,
+                lens_path / filename,
                 expected_hash=digest,
                 expected_size=size,
-                label=f"downloaded {spec.alias} {filename}",
+                label=f"{spec.alias} {filename}",
             )
-            copy_atomic(source, lens_path / filename)
-
-    for filename, (digest, size) in expected_files.items():
-        verify_file(
-            lens_path / filename,
-            expected_hash=digest,
-            expected_size=size,
-            label=f"{spec.alias} {filename}",
-        )
-    verify_lens_config(lens_path / "config.json", spec)
+        verify_lens_config(lens_path / "config.json", spec)
 
     snapshot_path = stage_model_snapshot(
         spec, hub_cache, verify_only, hf_hub_download
     )
     verify_model_snapshot(snapshot_path, spec)
-    if not verify_only:
+    if include_tuned_lens and not verify_only:
         write_json_atomic(
             {
                 "schema_version": 2,
@@ -253,41 +269,71 @@ def stage_one(spec, lens_root: Path, hub_cache: Path, verify_only: bool) -> None
             },
             lens_path / "resource-manifest.json",
         )
-    print(
-        f"{'Verified' if verify_only else 'Staged'} {spec.alias}: "
-        f"{lens_path}"
-    )
+    if include_tuned_lens:
+        print(
+            f"{'Verified' if verify_only else 'Staged'} {spec.alias}: "
+            f"{lens_path}"
+        )
+    else:
+        print(
+            f"{'Verified' if verify_only else 'Staged'} {spec.alias} "
+            f"base model: {snapshot_path}"
+        )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Stage exact model and tuned-lens snapshots for the cluster"
     )
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--model", choices=model_aliases())
     selection.add_argument("--all", action="store_true")
-    parser.add_argument("--lens-root", required=True)
+    parser.add_argument("--lens-root")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument(
         "--hf-home",
         default=os.environ.get("HF_HOME"),
         help="Hugging Face home; its hub subdirectory stores snapshots",
     )
     parser.add_argument("--verify-only", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     if not args.hf_home:
         raise ValueError("--hf-home or HF_HOME is required")
+    config = load_layer_factorial_config(args.config)
+    include_tuned_lens = (
+        "tuned-lens" in config.switches.lens_methods
+    )
+    if include_tuned_lens and not args.lens_root:
+        raise ValueError(
+            "--lens-root is required when tuned-lens is selected"
+        )
     hf_home = Path(args.hf_home).expanduser().resolve()
-    lens_root = Path(args.lens_root).expanduser().resolve()
+    lens_root = (
+        Path(args.lens_root).expanduser().resolve()
+        if include_tuned_lens else None
+    )
     hf_home.mkdir(parents=True, exist_ok=True)
-    lens_root.mkdir(parents=True, exist_ok=True)
+    if lens_root is not None:
+        lens_root.mkdir(parents=True, exist_ok=True)
     os.environ["HF_HOME"] = str(hf_home)
-    specs = MODEL_SPECS if args.all else (get_model_spec(args.model),)
+    if args.model and args.model not in config.models:
+        raise ValueError(
+            f"model {args.model!r} is not enabled by {config.source_path}"
+        )
+    aliases = config.models if args.all else (args.model,)
+    specs = tuple(get_model_spec(alias) for alias in aliases)
     for spec in specs:
-        stage_one(spec, lens_root, hf_home / "hub", args.verify_only)
+        stage_one(
+            spec,
+            lens_root,
+            hf_home / "hub",
+            args.verify_only,
+            include_tuned_lens=include_tuned_lens,
+        )
     return 0
 
 
