@@ -76,10 +76,18 @@ def parse_args():
     parser.add_argument("--output-fname", required=True)
     parser.add_argument("--model", required=True, choices=model_aliases())
     parser.add_argument(
+        "--hf-model-name",
+        help=(
+            "explicit Hugging Face repository loaded through the selected "
+            "wordsprobability wrapper; used for faithful deduplicated Pythia runs"
+        ),
+    )
+    parser.add_argument(
         "--model-revision",
         help=(
             "pinned Hugging Face base-model revision; a tuned-lens artifact "
-            "revision is used automatically and must agree when both are set"
+            "revision is used automatically when present and must agree when "
+            "both are set"
         ),
     )
     parser.add_argument(
@@ -1277,12 +1285,23 @@ def main():
         sentence_map, segmentation_sha256 = read_sentence_manifest(
             Path(args.sentence_map_fname), texts
         )
+    registered_model = get_model_spec(args.model)
+    effective_hf_model_name = args.hf_model_name or registered_model.hf_name
     effective_model_revision = args.model_revision
     tuned_artifact = None
     if args.lens_method == "tuned-lens":
         tuned_artifact = inspect_local_tuned_lens_artifact(
             args.tuned_lens_path
         )
+        artifact_model_name = tuned_artifact.config.get(
+            "base_model_name_or_path"
+        )
+        if artifact_model_name != effective_hf_model_name:
+            raise ValueError(
+                "loaded Hugging Face model name disagrees with the tuned-lens "
+                f"artifact: {effective_hf_model_name!r} versus "
+                f"{artifact_model_name!r}"
+            )
         artifact_revision = tuned_artifact.config.get("base_model_revision")
         if (
             effective_model_revision is not None
@@ -1296,8 +1315,20 @@ def main():
         if effective_model_revision is None:
             effective_model_revision = artifact_revision
     wrapper = load_wordsprobability_model(
-        args.model, revision=effective_model_revision
+        args.model,
+        revision=effective_model_revision,
+        hf_model_name=args.hf_model_name,
     )
+    loaded_hf_model_name = wrapper.hf_model_name
+    loaded_model_revision = wrapper.hf_model_revision
+    if loaded_hf_model_name != effective_hf_model_name:
+        raise RuntimeError(
+            "Loaded Hugging Face model identity mismatch: "
+            f"wrapper reports {loaded_hf_model_name!r}, expected "
+            f"{effective_hf_model_name!r}"
+        )
+    if loaded_model_revision is not None:
+        effective_model_revision = loaded_model_revision
     validate_registered_model_layer_count(args.model, wrapper.model)
     layers = validate_layers(
         wrapper.model,
@@ -1310,12 +1341,14 @@ def main():
         tuned_lens = load_local_tuned_lens_decoder(
             wrapper.model,
             args.tuned_lens_path,
-            expected_base_model_name=get_model_spec(args.model).hf_name,
+            expected_base_model_name=loaded_hf_model_name,
         )
         lens_identity = tuned_lens.provenance()
     log_internal_model_runtime(args.model, wrapper)
     print(
         f"INTERNAL-LAYER method={args.lens_method} "
+        f"hf_model_name={loaded_hf_model_name} "
+        f"model_revision={loaded_model_revision or effective_model_revision} "
         f"context_unit={args.context_unit} "
         f"first_word_policy={args.sentence_first_token_policy} "
         f"score_kinds={'corrected,buggy' if args.return_buggy_surprisals else 'corrected'} "
@@ -1349,7 +1382,10 @@ def main():
     )
     anchor_report["experiment"] = {
         "model": args.model,
+        "hf_model_name_requested": args.hf_model_name,
+        "hf_model_name_effective": loaded_hf_model_name,
         "model_revision_requested": args.model_revision,
+        "model_revision_loaded": loaded_model_revision,
         "model_revision_effective": effective_model_revision,
         "context_unit": args.context_unit,
         "sentence_first_token_policy": args.sentence_first_token_policy,

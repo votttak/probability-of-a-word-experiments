@@ -191,8 +191,15 @@ def corrected_word_surprisal(raw_surprisal, start_boundary_surprisal,
     return raw_surprisal - start_boundary_surprisal + end_boundary_surprisal
 
 
-def load_wordsprobability_model(model_name, revision=None):
-    """CONTEXT-LIMITED: Load one compatible model wrapper for the whole run."""
+def load_wordsprobability_model(model_name, revision=None, hf_model_name=None):
+    """Load one wrapper, optionally overriding its Hugging Face repository.
+
+    ``model_name`` continues to select the ``wordsprobability`` wrapper class
+    (and therefore its tokenizer-specific boundary handling). ``hf_model_name``
+    only replaces the repository loaded by that wrapper. This keeps the legacy
+    public path unchanged while allowing factorial runs to use Kuribayashi's
+    deduplicated Pythia checkpoints explicitly.
+    """
 
     # CONTEXT-LIMITED: Import lazily so pure unit tests never initialize or
     # download Transformer weights.
@@ -204,24 +211,35 @@ def load_wordsprobability_model(model_name, revision=None):
             "the main surprisal pipeline"
         ) from error
 
-    if revision is None:
+    if revision is not None and (
+        not isinstance(revision, str) or not revision.strip()
+    ):
+        raise ValueError("model revision must be a nonempty string")
+    if hf_model_name is not None and (
+        not isinstance(hf_model_name, str) or not hf_model_name.strip()
+    ):
+        raise ValueError("Hugging Face model name must be a nonempty string")
+
+    if revision is None and hf_model_name is None:
         wrapper = get_model(model_name)
     else:
-        if not isinstance(revision, str) or not revision.strip():
-            raise ValueError("model revision must be a nonempty string")
         try:
             wrapper_class = MODELS[model_name]
         except KeyError as error:
             raise ValueError(
                 f"wordsprobability has no wrapper for model {model_name!r}"
             ) from error
-        # Construct the same wrapper deterministically, but forward a pinned
-        # Hugging Face revision. The package's public constructor has no
-        # revision parameter, which would otherwise make a tuned-lens run use
-        # whichever base snapshot happens to be current in the local cache.
+        # Construct the same wrapper deterministically, but forward the exact
+        # repository/revision. The package's public constructor exposes neither
+        # override, which would otherwise make a tuned-lens run silently use
+        # the wrapper's ordinary (non-deduplicated) Pythia repository.
         wrapper = wrapper_class.__new__(wrapper_class)
+        loaded_hf_model_name = hf_model_name or wrapper_class.model_name
+        pretrained_kwargs = {}
+        if revision is not None:
+            pretrained_kwargs["revision"] = revision
         wrapper.model = wrapper_class.model_cls.from_pretrained(
-            wrapper_class.model_name, revision=revision
+            loaded_hf_model_name, **pretrained_kwargs
         )
         wrapper.model.eval()
         try:
@@ -231,7 +249,7 @@ def load_wordsprobability_model(model_name, revision=None):
         if torch.cuda.is_available():
             wrapper.model = wrapper.model.cuda()
         wrapper.tokenizer = wrapper_class.tokenizer_cls.from_pretrained(
-            wrapper_class.model_name, revision=revision
+            loaded_hf_model_name, **pretrained_kwargs
         )
         wrapper.device = wrapper.model.device
         wrapper.bos_token_id = wrapper.tokenizer.bos_token_id
@@ -244,6 +262,46 @@ def load_wordsprobability_model(model_name, revision=None):
             "The installed wordsprobability model wrapper is incompatible; "
             f"missing: {', '.join(missing)}"
         )
+    config = getattr(wrapper.model, "config", None)
+    actual_hf_model_name = None
+    for attribute in ("_name_or_path", "name_or_path"):
+        value = getattr(config, attribute, None)
+        if isinstance(value, str) and value.strip():
+            actual_hf_model_name = value.strip()
+            break
+    actual_hf_model_revision = getattr(config, "_commit_hash", None)
+    if not (
+        isinstance(actual_hf_model_revision, str)
+        and actual_hf_model_revision.strip()
+    ):
+        actual_hf_model_revision = None
+    else:
+        actual_hf_model_revision = actual_hf_model_revision.strip()
+
+    if (
+        hf_model_name is not None
+        and actual_hf_model_name is not None
+        and actual_hf_model_name != hf_model_name
+    ):
+        raise RuntimeError(
+            "loaded Hugging Face model name mismatch: "
+            f"observed {actual_hf_model_name!r}, requested {hf_model_name!r}"
+        )
+    if (
+        revision is not None
+        and actual_hf_model_revision is not None
+        and actual_hf_model_revision != revision
+    ):
+        raise RuntimeError(
+            "loaded Hugging Face model revision mismatch: "
+            f"observed {actual_hf_model_revision!r}, requested {revision!r}"
+        )
+
+    class_hf_model_name = getattr(wrapper, "model_name", None)
+    wrapper.hf_model_name = (
+        actual_hf_model_name or hf_model_name or class_hf_model_name
+    )
+    wrapper.hf_model_revision = actual_hf_model_revision
     return wrapper
 
 

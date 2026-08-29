@@ -4,11 +4,11 @@ import contextlib
 import csv
 import io
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -28,6 +28,9 @@ from h01_data.get_internal_layer_surprisals import (  # noqa: E402
     validate_registered_model_layer_count,
     weighted_boundary_surprisal,
     write_rows_atomic,
+)
+from h01_data.get_context_limited_surprisals import (  # noqa: E402
+    load_wordsprobability_model,
 )
 
 
@@ -118,6 +121,20 @@ class InternalLayerMappingTest(unittest.TestCase):
                     parse_args()
         self.assertEqual(raised.exception.code, 2)
 
+    def test_cli_accepts_explicit_hugging_face_model_name(self):
+        argv = [
+            "get_internal_layer_surprisals.py",
+            "--input-fname", "input.txt",
+            "--output-fname", "output.tsv",
+            "--model", "pythia-70m",
+            "--hf-model-name", "EleutherAI/pythia-70m-deduped",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = parse_args()
+        self.assertEqual(
+            args.hf_model_name, "EleutherAI/pythia-70m-deduped"
+        )
+
     def test_default_layers_are_block_outputs_only(self):
         model = SimpleNamespace(config=SimpleNamespace(n_layer=12))
         self.assertEqual(validate_layers(model, None), list(range(1, 13)))
@@ -164,6 +181,141 @@ class InternalLayerMappingTest(unittest.TestCase):
         self.assertEqual(
             logit_lens_modules(pythia), (pythia_norm, pythia_head)
         )
+
+
+class WordsProbabilityLoaderTest(unittest.TestCase):
+    @staticmethod
+    def _fake_modules(get_model, wrapper_class):
+        package = ModuleType("wordsprobability")
+        models = ModuleType("wordsprobability.models")
+        models.MODELS = {"pythia-70m": wrapper_class}
+        models.get_model = get_model
+        package.models = models
+        return {
+            "wordsprobability": package,
+            "wordsprobability.models": models,
+        }
+
+    def test_hf_override_reuses_wrapper_with_exact_revision(self):
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                _name_or_path="EleutherAI/pythia-70m-deduped",
+                _commit_hash="immutable-revision",
+            ),
+            device=torch.device("cpu"),
+            eval=Mock(),
+        )
+        tokenizer = SimpleNamespace(
+            bos_token_id=0,
+            eos_token_id=1,
+            name_or_path="EleutherAI/pythia-70m-deduped",
+        )
+        model_loader = Mock(return_value=model)
+        tokenizer_loader = Mock(return_value=tokenizer)
+
+        class FakeWrapper:
+            model_name = "EleutherAI/pythia-70m"
+            model_cls = SimpleNamespace(from_pretrained=model_loader)
+            tokenizer_cls = SimpleNamespace(from_pretrained=tokenizer_loader)
+
+            def _initialise_vocab_masks(self):
+                self.vocab_masks = {"ready": True}
+
+        get_model = Mock()
+        modules = self._fake_modules(get_model, FakeWrapper)
+        with patch.dict(sys.modules, modules), patch.object(
+            torch.cuda, "is_available", return_value=False
+        ):
+            wrapper = load_wordsprobability_model(
+                "pythia-70m",
+                revision="immutable-revision",
+                hf_model_name="EleutherAI/pythia-70m-deduped",
+            )
+
+        get_model.assert_not_called()
+        model_loader.assert_called_once_with(
+            "EleutherAI/pythia-70m-deduped",
+            revision="immutable-revision",
+        )
+        tokenizer_loader.assert_called_once_with(
+            "EleutherAI/pythia-70m-deduped",
+            revision="immutable-revision",
+        )
+        self.assertEqual(
+            wrapper.hf_model_name, "EleutherAI/pythia-70m-deduped"
+        )
+        self.assertEqual(wrapper.hf_model_revision, "immutable-revision")
+        self.assertEqual(wrapper.vocab_masks, {"ready": True})
+
+    def _load_override_with_actual_identity(self, name, revision):
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                _name_or_path=name,
+                _commit_hash=revision,
+            ),
+            device=torch.device("cpu"),
+            eval=Mock(),
+        )
+        tokenizer = SimpleNamespace(
+            bos_token_id=0,
+            eos_token_id=1,
+            name_or_path=name,
+        )
+
+        class FakeWrapper:
+            model_name = "EleutherAI/pythia-70m"
+            model_cls = SimpleNamespace(
+                from_pretrained=Mock(return_value=model)
+            )
+            tokenizer_cls = SimpleNamespace(
+                from_pretrained=Mock(return_value=tokenizer)
+            )
+
+            def _initialise_vocab_masks(self):
+                self.vocab_masks = {"ready": True}
+
+        modules = self._fake_modules(Mock(), FakeWrapper)
+        with patch.dict(sys.modules, modules), patch.object(
+            torch.cuda, "is_available", return_value=False
+        ):
+            return load_wordsprobability_model(
+                "pythia-70m",
+                revision="immutable-revision",
+                hf_model_name="EleutherAI/pythia-70m-deduped",
+            )
+
+    def test_explicit_hf_name_must_match_loaded_config(self):
+        with self.assertRaisesRegex(RuntimeError, "model name mismatch"):
+            self._load_override_with_actual_identity(
+                "EleutherAI/pythia-70m", "immutable-revision"
+            )
+
+    def test_explicit_revision_must_match_loaded_config(self):
+        with self.assertRaisesRegex(RuntimeError, "revision mismatch"):
+            self._load_override_with_actual_identity(
+                "EleutherAI/pythia-70m-deduped", "different-revision"
+            )
+
+    def test_default_loader_path_is_unchanged(self):
+        legacy = SimpleNamespace(
+            model=SimpleNamespace(config=SimpleNamespace(_name_or_path="gpt2")),
+            tokenizer=object(),
+            vocab_masks={},
+            model_name="gpt2",
+        )
+
+        class FakeWrapper:
+            model_name = "gpt2"
+
+        get_model = Mock(return_value=legacy)
+        modules = self._fake_modules(get_model, FakeWrapper)
+        with patch.dict(sys.modules, modules):
+            observed = load_wordsprobability_model("pythia-70m")
+
+        self.assertIs(observed, legacy)
+        get_model.assert_called_once_with("pythia-70m")
+        self.assertEqual(observed.hf_model_name, "gpt2")
+        self.assertIsNone(observed.hf_model_revision)
 
 
 class InternalLayerPersistenceTest(unittest.TestCase):

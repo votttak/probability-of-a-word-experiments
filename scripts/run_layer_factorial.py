@@ -17,6 +17,15 @@ import tempfile
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ROOT = REPOSITORY_ROOT / "src"
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
+
+from h01_data.layer_factorial_models import (  # noqa: E402
+    get_model_spec as get_factorial_model_spec,
+    model_aliases as factorial_model_aliases,
+)
+
 EXTRACTOR = REPOSITORY_ROOT / "src/h01_data/get_internal_layer_surprisals.py"
 MERGER = REPOSITORY_ROOT / "src/h01_data/build_layer_factorial_dataset.py"
 EVALUATOR = (
@@ -110,8 +119,7 @@ def validate_extraction_matches_run(
     args,
     extraction_paths,
     validation_path,
-    revision,
-    final_layer,
+    model_spec,
     expected_word_rows,
 ):
     """Prevent stale extraction cells from being relabeled by this run."""
@@ -124,7 +132,7 @@ def validate_extraction_matches_run(
     _require_equal(
         "model revision",
         validation.get("model_revision_effective"),
-        revision,
+        model_spec.base_model_revision,
     )
     expected = validation.get("expected")
     if not isinstance(expected, dict):
@@ -132,7 +140,9 @@ def validate_extraction_matches_run(
             "extraction validation manifest lacks expected dimensions"
         )
     _require_equal("row count", expected.get("rows"), len(expected_word_rows))
-    _require_equal("final layer", expected.get("final_layer"), final_layer)
+    _require_equal(
+        "final layer", expected.get("final_layer"), model_spec.final_layer
+    )
     _require_equal(
         "minimum layer",
         expected.get("min_layer"),
@@ -164,6 +174,16 @@ def validate_extraction_matches_run(
         artifact.get("params_sha256"),
         sha256_file(Path(args.tuned_lens_path) / "params.pt"),
     )
+    _require_equal(
+        "tuned-lens base model",
+        artifact.get("base_model_name_or_path"),
+        model_spec.hf_name,
+    )
+    _require_equal(
+        "tuned-lens base revision",
+        artifact.get("base_model_revision"),
+        model_spec.lens_base_model_revision,
+    )
 
     for (context, lens), extraction_path in extraction_paths.items():
         anchor = read_json_object(
@@ -183,7 +203,12 @@ def validate_extraction_matches_run(
         _require_equal(
             f"{context}/{lens} revision",
             experiment.get("model_revision_effective"),
-            revision,
+            model_spec.base_model_revision,
+        )
+        _require_equal(
+            f"{context}/{lens} Hugging Face model",
+            experiment.get("hf_model_name_effective"),
+            model_spec.hf_name,
         )
         if context == "sentence":
             _require_equal(
@@ -260,7 +285,7 @@ def run_command(command, environment):
     )
 
 
-def read_lens_config(lens_path):
+def read_lens_config(lens_path, model_spec):
     config_path = Path(lens_path) / "config.json"
     try:
         config = json.loads(config_path.read_text(encoding="utf8"))
@@ -268,11 +293,18 @@ def read_lens_config(lens_path):
         raise ValueError(
             f"unable to read tuned-lens config: {config_path}"
         ) from error
-    revision = config.get("base_model_revision")
-    if not isinstance(revision, str) or not revision.strip():
+    base_model_name = config.get("base_model_name_or_path")
+    if base_model_name != model_spec.hf_name:
         raise ValueError(
-            "tuned-lens config must pin base_model_revision so logit and "
-            "tuned cells can use the same model snapshot"
+            "tuned-lens config base model mismatch: "
+            f"observed {base_model_name!r}, expected {model_spec.hf_name!r}"
+        )
+    revision = config.get("base_model_revision")
+    if revision != model_spec.lens_base_model_revision:
+        raise ValueError(
+            "tuned-lens config base revision mismatch: "
+            f"observed {revision!r}, expected "
+            f"{model_spec.lens_base_model_revision!r}"
         )
     final_layer = config.get("num_hidden_layers")
     if (
@@ -284,14 +316,19 @@ def read_lens_config(lens_path):
             "tuned-lens config must contain a positive integer "
             "num_hidden_layers"
         )
-    return config, revision, final_layer
+    if final_layer != model_spec.final_layer:
+        raise ValueError(
+            "tuned-lens config layer-count mismatch: "
+            f"observed {final_layer}, expected {model_spec.final_layer}"
+        )
+    return config
 
 
 def cell_name(context, lens):
     return f"context_{context}-lens_{lens}"
 
 
-def extraction_command(args, context, lens, revision, cell_dir):
+def extraction_command(args, context, lens, model_spec, cell_dir):
     command = [
         args.python,
         EXTRACTOR,
@@ -301,8 +338,10 @@ def extraction_command(args, context, lens, revision, cell_dir):
         cell_dir / "internal-layer.tsv",
         "--model",
         args.model,
+        "--hf-model-name",
+        model_spec.hf_name,
         "--model-revision",
-        revision,
+        model_spec.base_model_revision,
         "--context-unit",
         context,
         "--lens-method",
@@ -332,7 +371,9 @@ def parse_args():
             "internal-layer evaluation in an isolated output root"
         )
     )
-    parser.add_argument("--model", default="gpt2-small")
+    parser.add_argument(
+        "--model", choices=factorial_model_aliases(), default="gpt2-small"
+    )
     parser.add_argument("--text-fname", required=True)
     parser.add_argument("--sentence-manifest-fname", required=True)
     parser.add_argument("--joint-data-fname", required=True)
@@ -400,7 +441,10 @@ def main():
     results_root = Path(args.results_root)
     checkpoint_root.mkdir(parents=True, exist_ok=True)
     results_root.mkdir(parents=True, exist_ok=True)
-    _, revision, final_layer = read_lens_config(args.tuned_lens_path)
+    model_spec = get_factorial_model_spec(args.model)
+    read_lens_config(args.tuned_lens_path, model_spec)
+    revision = model_spec.base_model_revision
+    final_layer = model_spec.final_layer
     expected_word_rows = read_expected_word_rows(args.text_fname)
     expected_rows = len(expected_word_rows)
 
@@ -430,7 +474,7 @@ def main():
         jobs = []
         for context, lens, _, cell_checkpoint in cells:
             command = extraction_command(
-                args, context, lens, revision, cell_checkpoint
+                args, context, lens, model_spec, cell_checkpoint
             )
             environment = (
                 tuned_environment if lens == "tuned-lens"
@@ -485,8 +529,7 @@ def main():
         args,
         extraction_paths,
         extraction_validation_path,
-        revision,
-        final_layer,
+        model_spec,
         expected_word_rows,
     )
 
@@ -577,9 +620,14 @@ def main():
     )
 
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "model": args.model,
+        "hf_model_name": model_spec.hf_name,
         "base_model_revision": revision,
+        "tuned_lens_artifact": model_spec.lens_artifact,
+        "tuned_lens_base_model_revision": (
+            model_spec.lens_base_model_revision
+        ),
         "include_embedding_layer": args.include_embedding_layer,
         "contexts": list(CONTEXTS),
         "score_kinds": ["corrected", "buggy"],

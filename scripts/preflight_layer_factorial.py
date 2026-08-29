@@ -47,6 +47,24 @@ EXPECTED_JOINT_SHA256 = {
     "gpt2-xl": (
         "eee2222c927b46dc40abb8c25867216099afd66fe651c572c8dba4bfc9ad1ec7"
     ),
+    "pythia-70m": (
+        "ce42bd06343fafdd15b7b812545d42d08db734006b691fb1ba2336c1d3b5d6b3"
+    ),
+    "pythia-160m": (
+        "0ca52420fa150c1dce3cf13e31a80e63fe90360516ff0ecc59fe848772100518"
+    ),
+    "pythia-410m": (
+        "38983a30c517b10a90545fe23e3a65523c7b1e688f6182bf2f88f085061b539b"
+    ),
+    "pythia-14b": (
+        "db8568a7638d7edb64e2f25a6708851cfc77a10d99d4649c1d3ec41ea649b9fa"
+    ),
+    "pythia-28b": (
+        "2fbb2a0e979f14dc80b080bcf2f3953c8ad464378a0488ad8ea7bf64fd27e210"
+    ),
+    "pythia-69b": (
+        "8aa3a9e74ad080d6b222644b04b6e044e20f725cca26f1492bef316217a7bc47"
+    ),
 }
 WORSPROBABILITY_VERSION = "0.17"
 MODEL_METADATA_PATTERNS = (
@@ -230,7 +248,7 @@ def validate_lens(path: Path, spec) -> dict:
     config = json.loads(config_path.read_text(encoding="utf8"))
     expected = {
         "base_model_name_or_path": spec.hf_name,
-        "base_model_revision": spec.base_model_revision,
+        "base_model_revision": spec.lens_base_model_revision,
         "num_hidden_layers": spec.final_layer,
     }
     for key, value in expected.items():
@@ -305,7 +323,11 @@ def validate_model_cache(spec, hf_home: Path) -> dict:
         repo_id=spec.hf_name,
         revision=spec.base_model_revision,
         cache_dir=hf_home / "hub",
-        allow_patterns=(*MODEL_METADATA_PATTERNS, spec.base_weight_file),
+        allow_patterns=(
+            *MODEL_METADATA_PATTERNS,
+            *spec.base_tokenizer_files,
+            *spec.base_weight_files,
+        ),
         local_files_only=True,
     ))
     config = json.loads((snapshot / "config.json").read_text(encoding="utf8"))
@@ -316,14 +338,20 @@ def validate_model_cache(spec, hf_home: Path) -> dict:
         raise ValueError(
             f"cached model has {layers!r} layers; expected {spec.final_layer}"
         )
-    for filename in ("vocab.json", "merges.txt", spec.base_weight_file):
+    required_files = (
+        "config.json",
+        *spec.base_tokenizer_files,
+        *spec.base_weight_files,
+    )
+    for filename in required_files:
         path = snapshot / filename
         if not path.is_file() or path.stat().st_size == 0:
             raise FileNotFoundError(f"cached model resource is missing: {path}")
     return {
         "repository": spec.hf_name,
         "revision": spec.base_model_revision,
-        "weight_file": spec.base_weight_file,
+        "weight_files": list(spec.base_weight_files),
+        "tokenizer_files": list(spec.base_tokenizer_files),
         "snapshot_path": str(snapshot.resolve()),
     }
 
@@ -346,8 +374,27 @@ def validate_offline_smoke(spec, lens_path: Path) -> dict:
     import torch
 
     wrapper = load_wordsprobability_model(
-        spec.alias, revision=spec.base_model_revision
+        spec.alias,
+        revision=spec.base_model_revision,
+        hf_model_name=spec.hf_name,
     )
+    effective_hf_name = getattr(
+        wrapper,
+        "hf_model_name",
+        getattr(wrapper.model.config, "_name_or_path", None),
+    )
+    if effective_hf_name != spec.hf_name:
+        raise RuntimeError(
+            "offline smoke loaded the wrong base repository: "
+            f"observed {effective_hf_name!r}, expected {spec.hf_name!r}"
+        )
+    effective_hf_revision = getattr(wrapper, "hf_model_revision", None)
+    if effective_hf_revision != spec.base_model_revision:
+        raise RuntimeError(
+            "offline smoke loaded the wrong base revision: "
+            f"observed {effective_hf_revision!r}, "
+            f"expected {spec.base_model_revision!r}"
+        )
     decoder = load_local_tuned_lens_decoder(
         wrapper.model,
         lens_path,
@@ -386,6 +433,8 @@ def validate_offline_smoke(spec, lens_path: Path) -> dict:
         "logit_shape": list(decoded.shape),
         "device": str(parameter.device),
         "dtype": str(parameter.dtype),
+        "hf_model_name_effective": effective_hf_name,
+        "hf_model_revision_effective": effective_hf_revision,
         "decoder_package_version": decoder.package_version,
         "artifact_config_sha256": decoder.artifact.config_sha256,
         "artifact_params_sha256": decoder.artifact.params_sha256,

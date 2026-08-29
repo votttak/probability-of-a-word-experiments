@@ -13,8 +13,10 @@ per reading-time response.
 
 ## Settings held fixed
 
-- The tuned-lens artifact pins the exact Hugging Face model revision. All four
-  extraction cells use that same revision.
+- The experiment registry pins one immutable base-model revision for all four
+  extraction cells. Lens base identity and artifact hashes are validated
+  separately; the official Pythia lens configs have a null
+  `base_model_revision`.
 - Layers include the embedding output (layer 0) and every transformer block
   output through layer D.
 - Sentence cells use Kuribayashi-style beginning-of-word scoring at sentence
@@ -77,14 +79,25 @@ a full model, so the four context/decoder cells must run sequentially.
 
 ## Supported full models
 
-The faithful tuned-lens grid is defined for `gpt2-small`,
-`gpt2-large`, and `gpt2-xl`. Every base-model revision and
-both files in every tuned-lens artifact are pinned and hash-checked.
+The supported tuned-lens grid contains the nine-model overlap with the earlier
+N/C/L experiment:
+
+- `gpt2-small`, `gpt2-large`, and `gpt2-xl`;
+- `pythia-70m`, `pythia-160m`, `pythia-410m`, `pythia-14b`,
+  `pythia-28b`, and `pythia-69b`.
+
+The Pythia aliases load Kuribayashi's deduplicated model repositories, not the
+non-deduplicated checkpoints used by the earlier N/C/L extraction. The registry
+pins `step143000` as our documented final-checkpoint resolution and records
+its immutable commit in every run. This is not a recovered lens-training SHA:
+the official Pythia lens configs identify the base repository but have a null
+`base_model_revision`. The pre-existing joint TSVs provide only RT rows, word
+keys, and controls; their old surprisal columns are not predictors here.
 
 GPT-2 Medium is not included because the official tuned-lens repository has no
-GPT-2 Medium lens. Pythia is not silently substituted: Kuribayashi's tuned-lens
-commands use deduplicated Pythia checkpoints, whereas the existing project
-aliases refer to non-deduplicated checkpoints.
+GPT-2 Medium lens. Kuribayashi also evaluated Pythia 1B/12B and selected OPT
+models, but they are outside the model overlap being diagnosed here. Every
+included base-model revision and both tuned-lens files are pinned and checked.
 
 ## Cluster preparation
 
@@ -95,13 +108,15 @@ experiment is forced offline after an exact cache preflight.
 After pulling this commit and activating the project's Conda environment:
 
 ```bash
-cd /home/durnovv/projects/probability-of-a-word-experiments
-source ~/miniforge3/etc/profile.d/conda.sh
+cd "$HOME/probability-of-a-word-experiments"
+source "$HOME/miniforge3/etc/profile.d/conda.sh"
 conda activate probability-of-a-word
 export RUN_ROOT=/pub/hofmann-scratch/students/durnovv/probability-of-a-word
-export HF_HOME=/pub/hofmann-scratch/huggingface_cache
-export TUNED_LENS_ROOT=$RUN_ROOT/resources/tuned-lens
-export TUNED_LENS_PYTHONPATH=$RUN_ROOT/python/tuned-lens-0.2.0
+export HF_HOME="$RUN_ROOT/huggingface_cache"
+export HF_HUB_DISABLE_XET=1
+export HF_HUB_DOWNLOAD_TIMEOUT=120
+export TUNED_LENS_ROOT="$RUN_ROOT/resources/tuned-lens"
+export TUNED_LENS_PYTHONPATH="$RUN_ROOT/python/tuned-lens-0.2.0"
 mkdir -p "$TUNED_LENS_PYTHONPATH"
 python -m pip install --target "$TUNED_LENS_PYTHONPATH" --no-deps "tuned-lens==0.2.0"
 python scripts/stage_layer_factorial_resources.py --all --lens-root "$TUNED_LENS_ROOT" --hf-home "$HF_HOME"
@@ -126,17 +141,18 @@ base revisions and artifact hashes live in
 ## Cluster run
 
 Start a persistent shell, select exactly one GPU, and dry-run the full
-three-model sequence:
+nine-model sequence:
 
 ```bash
 tmux new -s layer-factorial
-cd /home/durnovv/projects/probability-of-a-word-experiments
-source ~/miniforge3/etc/profile.d/conda.sh
+cd "$HOME/probability-of-a-word-experiments"
+source "$HOME/miniforge3/etc/profile.d/conda.sh"
 conda activate probability-of-a-word
 export RUN_ROOT=/pub/hofmann-scratch/students/durnovv/probability-of-a-word
-export HF_HOME=/pub/hofmann-scratch/huggingface_cache
-export TUNED_LENS_ROOT=$RUN_ROOT/resources/tuned-lens
-export TUNED_LENS_PYTHONPATH=$RUN_ROOT/python/tuned-lens-0.2.0
+export HF_HOME="$RUN_ROOT/huggingface_cache"
+export HF_HUB_DISABLE_XET=1
+export TUNED_LENS_ROOT="$RUN_ROOT/resources/tuned-lens"
+export TUNED_LENS_PYTHONPATH="$RUN_ROOT/python/tuned-lens-0.2.0"
 export CUDA_VISIBLE_DEVICES=0
 export EXPECTED_GIT_COMMIT=$(git rev-parse HEAD)
 scripts/run_all_layer_factorial_cluster.sh --dry-run
@@ -146,7 +162,7 @@ scripts/run_all_layer_factorial_cluster.sh
 To run or resume only one model:
 
 ```bash
-scripts/run_layer_factorial_cluster.sh gpt2-xl
+scripts/run_layer_factorial_cluster.sh pythia-69b
 ```
 
 Rerunning the same command is safe. Passage checkpoints are reused only after

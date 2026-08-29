@@ -23,8 +23,23 @@ class LayerFactorialRunnerTest(unittest.TestCase):
         self.manifest.write_text("manifest\n", encoding="utf8")
         self.lens = self.root / "lens"
         self.lens.mkdir()
-        (self.lens / "config.json").write_text("{}\n", encoding="utf8")
+        (self.lens / "config.json").write_text(
+            json.dumps({
+                "base_model_name_or_path": "gpt2",
+                "base_model_revision": "revision",
+                "num_hidden_layers": 12,
+            }) + "\n",
+            encoding="utf8",
+        )
         (self.lens / "params.pt").write_bytes(b"parameters")
+        self.spec = SimpleNamespace(
+            alias="gpt2-small",
+            hf_name="gpt2",
+            base_model_revision="revision",
+            final_layer=12,
+            lens_artifact="gpt2",
+            lens_base_model_revision="revision",
+        )
         self.paths = {}
         for context in ("passage", "sentence"):
             for lens in ("logit-lens", "tuned-lens"):
@@ -45,6 +60,7 @@ class LayerFactorialRunnerTest(unittest.TestCase):
                     )
                 experiment = {
                     "model": "gpt2-small",
+                    "hf_model_name_effective": "gpt2",
                     "model_revision_effective": "revision",
                     "sentence_first_token_policy": "bow",
                 }
@@ -81,6 +97,8 @@ class LayerFactorialRunnerTest(unittest.TestCase):
                     "params_sha256": runner.sha256_file(
                         self.lens / "params.pt"
                     ),
+                    "base_model_name_or_path": "gpt2",
+                    "base_model_revision": "revision",
                 }
             },
         }
@@ -91,8 +109,7 @@ class LayerFactorialRunnerTest(unittest.TestCase):
             self.args,
             self.paths,
             self.validation,
-            "revision",
-            12,
+            self.spec,
             runner.read_expected_word_rows(self.text),
         )
 
@@ -106,6 +123,18 @@ class LayerFactorialRunnerTest(unittest.TestCase):
 
     def test_stale_sentence_policy_is_rejected(self):
         self.args.sentence_first_token_policy = "bos"
+        with self.assertRaisesRegex(ValueError, "provenance mismatch"):
+            self._validate()
+
+    def test_stale_hugging_face_model_is_rejected(self):
+        anchor_path = Path(
+            f"{self.paths[('sentence', 'tuned-lens')]}.anchor.json"
+        )
+        anchor = json.loads(anchor_path.read_text(encoding="utf8"))
+        anchor["experiment"]["hf_model_name_effective"] = (
+            "EleutherAI/pythia-70m-deduped"
+        )
+        anchor_path.write_text(json.dumps(anchor), encoding="utf8")
         with self.assertRaisesRegex(ValueError, "provenance mismatch"):
             self._validate()
 
@@ -145,6 +174,60 @@ class LayerFactorialRunnerTest(unittest.TestCase):
             args.precomputed_frequency_fname,
             (self.root / "frequency").resolve(),
         )
+
+    def test_extraction_command_passes_pinned_hf_override(self):
+        args = SimpleNamespace(
+            python="python",
+            model="pythia-70m",
+            text_fname=self.text,
+            include_embedding_layer=True,
+            sentence_manifest_fname=self.manifest,
+            sentence_first_token_policy="bow",
+            tuned_lens_path=self.lens,
+        )
+        spec = SimpleNamespace(
+            hf_name="EleutherAI/pythia-70m-deduped",
+            base_model_revision="base-revision",
+        )
+        command = runner.extraction_command(
+            args, "sentence", "tuned-lens", spec, self.root / "cell"
+        )
+        self.assertEqual(
+            command[command.index("--hf-model-name") + 1], spec.hf_name
+        )
+        self.assertEqual(
+            command[command.index("--model-revision") + 1],
+            spec.base_model_revision,
+        )
+
+    def test_lens_config_accepts_registry_expected_null_revision(self):
+        spec = SimpleNamespace(
+            hf_name="EleutherAI/pythia-70m-deduped",
+            lens_base_model_revision=None,
+            final_layer=6,
+        )
+        config_path = self.lens / "config.json"
+        config_path.write_text(
+            json.dumps({
+                "base_model_name_or_path": spec.hf_name,
+                "base_model_revision": None,
+                "num_hidden_layers": spec.final_layer,
+            }),
+            encoding="utf8",
+        )
+        observed = runner.read_lens_config(self.lens, spec)
+        self.assertIsNone(observed["base_model_revision"])
+
+        config_path.write_text(
+            json.dumps({
+                "base_model_name_or_path": spec.hf_name,
+                "base_model_revision": "unexpected",
+                "num_hidden_layers": spec.final_layer,
+            }),
+            encoding="utf8",
+        )
+        with self.assertRaisesRegex(ValueError, "base revision mismatch"):
+            runner.read_lens_config(self.lens, spec)
 
 
 if __name__ == "__main__":

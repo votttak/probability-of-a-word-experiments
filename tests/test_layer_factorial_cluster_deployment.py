@@ -34,8 +34,10 @@ class LayerFactorialClusterDeploymentTest(unittest.TestCase):
         self.assertNotIn("--jobs 4", text)
         all_text = all_launcher.read_text(encoding="utf8")
         self.assertIn(
-            "for model in gpt2-small gpt2-large gpt2-xl", all_text
+            'mapfile -t MODELS < <("$PYTHON_BIN" "$REGISTRY" --list)',
+            all_text,
         )
+        self.assertIn('for model in "${MODELS[@]}"', all_text)
 
     def test_makefile_uses_tracked_portable_inputs_and_one_job(self):
         text = (
@@ -50,6 +52,16 @@ class LayerFactorialClusterDeploymentTest(unittest.TestCase):
         self.assertNotIn(
             "layer_factorial_full: $(FULL_SENTENCE_MANIFEST)", text
         )
+
+    def test_resource_staging_defaults_to_non_xet_downloads(self):
+        text = (
+            REPOSITORY_ROOT / "scripts/stage_layer_factorial_resources.py"
+        ).read_text(encoding="utf8")
+        self.assertIn(
+            'os.environ.setdefault("HF_HUB_DISABLE_XET", "1")', text
+        )
+        self.assertIn("*spec.base_weight_files", text)
+        self.assertIn("*spec.base_tokenizer_files", text)
 
     def test_preflight_validates_lens_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -68,6 +80,7 @@ class LayerFactorialClusterDeploymentTest(unittest.TestCase):
                 hf_name="fixture/model",
                 final_layer=2,
                 base_model_revision="revision",
+                lens_base_model_revision="revision",
                 lens_config_sha256=hashlib.sha256(
                     config_bytes
                 ).hexdigest(),

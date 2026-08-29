@@ -11,7 +11,10 @@ usage() {
   cat <<'EOF'
 Usage: scripts/run_layer_factorial_cluster.sh MODEL [--dry-run]
 
-Supported MODEL values: gpt2-small, gpt2-large, gpt2-xl.
+Supported MODEL values:
+  gpt2-small, gpt2-large, gpt2-xl,
+  pythia-70m, pythia-160m, pythia-410m,
+  pythia-14b, pythia-28b, pythia-69b.
 
 Required environment:
   RUN_ROOT             Absolute scratch root for checkpoints/results/logs

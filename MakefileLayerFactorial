@@ -23,7 +23,8 @@ CANONICAL_JOINT_FILE ?= checkpoints/rt/merged_data/natural_stories-$(MODEL).tsv
 
 # These are explicit local resources. The scorer verifies artifact hashes,
 # architecture, base name, layer count, width, and exact base revision.
-TUNED_LENS_ARTIFACT ?= $(if $(filter gpt2-small,$(MODEL)),gpt2,$(MODEL))
+LAYER_FACTORIAL_MODEL_REGISTRY := src/h01_data/layer_factorial_models.py
+TUNED_LENS_ARTIFACT ?= $(shell $(PYTHON) $(LAYER_FACTORIAL_MODEL_REGISTRY) --model "$(MODEL)" --field lens_artifact)
 TUNED_LENS_PATH ?= .cache/tuned-lens-repo/lens/$(TUNED_LENS_ARTIFACT)
 TUNED_LENS_PYTHONPATH ?= .cache/python/tuned-lens-0.2.0
 WORDFREQ_PYTHONPATH ?= .cache/python/wordfreq-3.1.1

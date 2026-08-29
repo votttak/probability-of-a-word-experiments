@@ -14,6 +14,9 @@ import sys
 import tempfile
 
 
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
@@ -105,7 +108,7 @@ def verify_lens_config(path: Path, spec) -> dict:
         raise ValueError(f"unable to read tuned-lens config: {path}") from error
     expected = {
         "base_model_name_or_path": spec.hf_name,
-        "base_model_revision": spec.base_model_revision,
+        "base_model_revision": spec.lens_base_model_revision,
         "num_hidden_layers": spec.final_layer,
     }
     for key, value in expected.items():
@@ -133,7 +136,12 @@ def verify_model_snapshot(snapshot_path: Path, spec) -> None:
             f"cached {spec.alias} has {layer_count!r} layers; "
             f"expected {spec.final_layer}"
         )
-    for filename in ("vocab.json", "merges.txt", spec.base_weight_file):
+    required_files = (
+        "config.json",
+        *spec.base_tokenizer_files,
+        *spec.base_weight_files,
+    )
+    for filename in required_files:
         path = snapshot_path / filename
         if not path.is_file() or path.stat().st_size == 0:
             raise FileNotFoundError(
@@ -184,26 +192,32 @@ def stage_one(spec, lens_root: Path, hub_cache: Path, verify_only: bool) -> None
         repo_id=spec.hf_name,
         revision=spec.base_model_revision,
         cache_dir=hub_cache,
-        allow_patterns=(*MODEL_METADATA_PATTERNS, spec.base_weight_file),
+        allow_patterns=(
+            *MODEL_METADATA_PATTERNS,
+            *spec.base_tokenizer_files,
+            *spec.base_weight_files,
+        ),
         local_files_only=verify_only,
     ))
     verify_model_snapshot(snapshot_path, spec)
     if not verify_only:
         write_json_atomic(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "model": spec.alias,
                 "base_model": {
-                "repository": spec.hf_name,
-                "revision": spec.base_model_revision,
-                "weight_file": spec.base_weight_file,
-                "snapshot_path": str(snapshot_path.resolve()),
+                    "repository": spec.hf_name,
+                    "revision": spec.base_model_revision,
+                    "weight_files": list(spec.base_weight_files),
+                    "tokenizer_files": list(spec.base_tokenizer_files),
+                    "snapshot_path": str(snapshot_path.resolve()),
                 },
                 "tuned_lens": {
                     "repository": TUNED_LENS_REPOSITORY,
                     "repository_type": TUNED_LENS_REPOSITORY_TYPE,
                     "revision": TUNED_LENS_REVISION,
                     "artifact": spec.lens_artifact,
+                    "base_model_revision": spec.lens_base_model_revision,
                     "config_sha256": spec.lens_config_sha256,
                     "params_sha256": spec.lens_params_sha256,
                 },
